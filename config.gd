@@ -3,7 +3,8 @@ extends RefCounted
 
 const YAML = preload("res://addons/addon_lib/yaml_parser/yaml.gd") #! ignore-remote
 const DEFAULTS = {"structs": true, "inline_functions": true, "scalar_replacement": true,
-	"struct_read_types": "typed_locals", "allow_ref_counted": false}
+	"struct_read_types": "typed_locals", "scalar_replacement_allow_ref_counted": false, "struct_read_types_allow_ref_counted": false,
+	"inline_functions_allow_ref_counted": false, "inline_functions_allow_variants": false}
 const READ_MODES = ["off", "typed_locals", "as_casts"]
 
 
@@ -29,7 +30,9 @@ static func from_dictionary(data:Variant) -> Dictionary:
 	if not data is Dictionary:
 		return {"options": {}, "errors": ["Optimizer config must be a YAML mapping."]}
 	for key in data:
-		if not DEFAULTS.has(key):
+		if key == "allow_ref_counted":
+			errors.append("allow_ref_counted was replaced by scalar_replacement_allow_ref_counted and struct_read_types_allow_ref_counted.")
+		elif not DEFAULTS.has(key):
 			errors.append("Unknown optimizer option: %s" % str(key))
 		elif key == "struct_read_types":
 			if not data[key] is String or data[key] not in READ_MODES:

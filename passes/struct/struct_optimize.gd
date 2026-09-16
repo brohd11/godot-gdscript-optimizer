@@ -16,7 +16,8 @@ var _types
 var _lines:PackedStringArray
 var _tokens:Array
 var _mode:int
-var _allow_references:bool
+var _scalar_references:bool
+var _read_references:bool
 var type_dependencies:Dictionary = {}
 var _source:String
 var _prefix:String
@@ -28,7 +29,8 @@ func _init(lines:PackedStringArray, types, context) -> void:
 	_lines = lines
 	_types = types
 	_mode = context.struct_read_types
-	_allow_references = context.allow_ref_counted
+	_scalar_references = context.scalar_replacement_allow_ref_counted
+	_read_references = context.struct_read_types_allow_ref_counted
 	_source = types.parser.get_script_path()
 	var source := "\n".join(lines)
 	_prefix = "_struct_opt_"
@@ -59,22 +61,20 @@ func field_type(path:String, field:String) -> String:
 		var declaration:Variant = parser.Utils.get_var_or_const_info(parser.code_edit.get_line(item.line).strip_edges())
 		if declaration != null and (item.type != "" or declaration[3]):
 			result = owner.get_member_type(field).trim_suffix(parser.Keys.INS_DELIM)
-			if not _supported_type(result):
-				result = ""
 	_field_types[key] = result
 	return result
 
 
-func _supported_type(type:String) -> bool:
+func _supported_type(type:String, allow_references:bool) -> bool:
 	if type in ValueTypes.VALUES:
 		return true
-	if not _allow_references or type in ["", "Variant", "null"]:
+	if not allow_references or type in ["", "Variant", "null"]:
 		return false
 	if type.contains("["):
 		if type.get_slice("[", 0) not in ["Array", "Dictionary"]:
 			return false
 		for arg:String in _types.parser.Utils.GDScriptParse.safe_split_args(type.substr(type.find("[") + 1).trim_suffix("]")):
-			if arg.strip_edges() != "Variant" and not _supported_type(arg.strip_edges()):
+			if arg.strip_edges() != "Variant" and not _supported_type(arg.strip_edges(), allow_references):
 				return false
 		return true
 	return type.contains(".gd") or ClassDB.class_exists(type) or _types._variant_types().has(type)
@@ -163,7 +163,7 @@ func _assess(candidate:Dictionary) -> String:
 	var def:Dictionary = _types.structs[candidate.path]
 	for field:Dictionary in def.fields:
 		var type := field_type(candidate.path, field.name)
-		if type.is_empty():
+		if not _supported_type(type, _scalar_references):
 			return "field %s has an unsupported or dynamic type" % field.name
 		var emitted := _emit_type(type)
 		if emitted.is_empty():
@@ -216,7 +216,7 @@ func _initialize(candidate:Dictionary, def:Dictionary) -> String:
 		if type != "":
 			var parser = _types.parser.get_parser_for_path(def.file)
 			type = ValueTypes.normalize(type, parser, def.body_start)
-			if not _supported_type(type):
+			if not _supported_type(type, _scalar_references):
 				return ""
 			type = _emit_type(type)
 			if type.is_empty():
@@ -245,7 +245,7 @@ func _initialize(candidate:Dictionary, def:Dictionary) -> String:
 
 
 func _immutable(expression:String) -> bool:
-	if _allow_references:
+	if _scalar_references:
 		if expression == "null":
 			return true
 		if expression in ["[]", "{}"]:
@@ -311,13 +311,16 @@ func replacement(path:String, field:String, receiver:String, lowered:String, lin
 		return lowered
 	var type := field_type(path, field)
 	var code := _code(line)
-	if type.is_empty() or _write_target(code, start, end):
+	if not _supported_type(type, _read_references) or _write_target(code, start, end):
 		return lowered
 	var tokens:Array = _types.parser.CodeEditParser.LambdaScanner._tokens(code)
 	if not _complete[line] or tokens.any(func(token): return token.text in [";", "func"]):
 		stats.struct_reads_skipped += 1
 		return lowered
 	var suffix := code.substr(end).strip_edges()
+	# Packed-array casts can copy storage, so receiver mutations must stay on the field.
+	if type.begins_with("Packed") and RegEx.create_from_string(r"^\.\w+\s*\(").search(suffix) != null:
+		return lowered
 	if _explicit_cast(code, start, end, type, line):
 		return lowered
 	if _mode == 1:

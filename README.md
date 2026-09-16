@@ -45,7 +45,8 @@ No writes, export lifecycle methods, or editor reporting belong in a pass.
 context.scalar_replacement = true
 context.struct_read_types = Optimizer.Context.StructReadTypes.TYPED_LOCALS
 # Alternatives: OFF (default), AS_CASTS.
-context.allow_ref_counted = false # Explicit opt-in for reference field locals/casts.
+context.scalar_replacement_allow_ref_counted = false
+context.struct_read_types_allow_ref_counted = false
 ```
 
 These settings extend `StructPass`; neither changes default output. Scalar replacement
@@ -66,8 +67,9 @@ complex receivers, and writes. `AS_CASTS` wraps reads in `(receiver[S.FIELD] as 
 moving them; it skips writes, multiline statements, and inline lambdas/semicolon statements.
 By default both use the same built-in value types as the inliner. No repeated-read caching is performed.
 
-`allow_ref_counted = true` admits known Object/Node/RefCounted and script types,
-collections, packed arrays, Callable, Signal, and nested structs in both optimizations.
+`scalar_replacement_allow_ref_counted` and `struct_read_types_allow_ref_counted`
+independently admit known Object/Node/RefCounted and script types, collections, packed
+arrays, Callable, Signal, and nested structs in their respective optimization.
 This opt-in can prolong reference lifetimes and add runtime checks on freed objects.
 Escape/evaluation-order checks and the inliner's type rules remain unchanged. Scalar
 initializers additionally accept null, literal collections, and empty built-in constructors;
@@ -79,7 +81,8 @@ metadata; scalar declarations preserve typed collections. Unknown types are skip
 `Optimizer.Config.from_file(path = "")` loads one YAML mapping using the required YAMLParser dependency,
 returning `{options, errors}`. `from_dictionary(data)` validates an in-memory mapping.
 Export defaults enable structs, inline_functions, scalar_replacement, and typed_locals;
-allow_ref_counted stays false. Missing keys inherit defaults, and invalid/unknown options
+All reference and Variant opt-ins stay false. The old `allow_ref_counted` key is rejected;
+replace it with the two struct flags above. Missing keys inherit defaults, and invalid/unknown options
 produce errors with no usable options. `struct_read_types` accepts off, typed_locals,
 or as_casts and normalizes to the Context enum. Context and prepare defaults are unchanged;
 other hosts must explicitly select these export defaults.
@@ -102,9 +105,23 @@ for both. The default remains `[Optimizer.StructPass]`. Inline replay resolves c
 against its input buffer, including line changes made by the struct pass.
 
 Preflight assesses each tagged function once; replay chooses one of two paths.
-The direct path retains the numeric arithmetic grammar (`+ - * / %`, parentheses,
-unary `+ -`) and substitutes matching numeric literals or statically typed locals.
-It emits no argument temporaries.
+The direct path supports a single returned expression, including parenthesized multiline
+returns. It accepts arithmetic (`+ - * / %`, unary `+ -`), comparisons, `and/or/not`,
+literals, parameters, and String `begins_with`, `ends_with`, `contains`, and `is_empty`.
+It substitutes matching literals or statically typed locals, retaining return types,
+precedence, and short-circuiting. Direct calls may appear in `if`, `elif`, `while`, and
+larger expressions. It emits no argument temporaries and skips omitted arguments.
+
+`context.inline_functions_allow_ref_counted = true` permits direct reference types,
+including Object/Node, containers and script classes, with member/index reads and method
+calls. It removes parameter lifetime protection and may change aliasing behavior.
+`context.inline_functions_allow_variants = true` permits explicit/implicit Variant
+signatures and Variant locals passed to typed parameters. Substitution is unchecked:
+parameter/return conversions and checks can disappear, changing results or errors.
+Unknown runtime values may themselves contain references; statically known reference
+types still require the reference flag. Both flags default to false and affect only
+direct substitution. Calls, properties, and indexed expressions supplied as arguments
+remain ineligible, even with both flags enabled. The same flag names are YAML keys.
 
 The template path supports explicit built-in value types, Array/Dictionary (including
 typed collections), RefCounted, and typed RefCounted-derived scripts. Tagged structs
@@ -141,7 +158,7 @@ resolvable immutable value constants. Mutable collection or executable defaults 
 the omitted-argument call unchanged; explicitly supplying that argument remains eligible.
 
 Calls use a script constant/global class, or a direct call inside another static
-function in the same script. Original definitions remain intact. Variant declarations,
+function in the same script. Original definitions remain intact. Template Variant declarations,
 loops, arbitrary early returns, lambdas/await in imported bodies, mutable external
 bindings, and nested inlining remain unsupported. Ambiguous/unsupported sites stay
 unchanged with diagnostics. No expansion is hoisted from a larger expression.
@@ -154,3 +171,8 @@ Replay stats expose `inline_calls`, `inline_skipped`, `inline_direct_calls`,
 Tagging is opt-in: removal of call overhead does not guarantee a speedup for every body.
 
 Tests: `godot --headless --path . --script res://tests/gdscript_optimizer/run_headless.gd`.
+
+Predicate benchmark (original versus transformed code, median microseconds and checksum):
+`godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_expression.gd -- 200000 7`.
+It reports typed and Variant callers with the Variant opt-in disabled/enabled; timings
+exclude optimization, compilation, startup, and warmup. No fixed speedup is asserted.

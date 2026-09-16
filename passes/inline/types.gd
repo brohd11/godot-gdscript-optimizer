@@ -6,7 +6,7 @@ const VALUES = ["bool", "int", "float", "String", "StringName", "NodePath", "Vec
 
 
 static func normalize(type:String, parser, line:int) -> String:
-	type = type.trim_suffix(parser.Keys.INS_DELIM)
+	type = type.trim_suffix(parser.Keys.INS_DELIM).replace(".gd.", ".gd::")
 	if type.contains("["):
 		var base := type.get_slice("[", 0)
 		if base not in ["Array", "Dictionary"]:
@@ -25,7 +25,7 @@ static func expression_type(parser, expression:String, line:int, column:int = -1
 	var type:String = parser.resolve_expression_to_type(expression, line, column)
 	if type.contains(parser.Keys.TYPE_DELIM):
 		type = type.get_slice(parser.Keys.TYPE_DELIM, 1)
-	return type.trim_suffix(parser.Keys.INS_DELIM)
+	return type.trim_suffix(parser.Keys.INS_DELIM).replace(".gd.", ".gd::")
 
 
 static func is_reference(type:String) -> bool:
@@ -47,7 +47,9 @@ static func supported(type:String, parser) -> bool:
 		var parts := type.split("::", true, 1)
 		var script = load(parts[0]) as GDScript
 		if parts.size() > 1:
-			script = parser.UClassDetail.resolve_script_access_path(script, parts[1].replace("::", ".")) as GDScript
+			for member:String in parts[1].replace("::", ".").split("."):
+				var nested:Variant = script.get_script_constant_map().get(member) if script != null else null
+				script = nested if nested is GDScript else null
 		return script != null and ClassDB.is_parent_class(script.get_instance_base_type(), "RefCounted")
 	return false
 

@@ -3,6 +3,7 @@ extends RefCounted
 
 const Registry = preload("res://addons/addon_lib/tag_parser/registry.gd")
 const Body = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/body.gd")
+const DirectExpression = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/expression.gd")
 const Arithmetic = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/arithmetic.gd")
 
 var plans:Dictionary = {}
@@ -64,13 +65,17 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 	for name:String in function.get_arguments():
 		var argument:Dictionary = function.get_arguments()[name]
 		var type := Body.TypeInfo.normalize(argument.type, parser, function.declaration_line)
-		if not Body.TypeInfo.supported(type, parser) or not argument.has_static_type:
+		if type == "" or not argument.has_static_type:
+			type = "Variant"
+		if not _direct_type(type) and (not Body.TypeInfo.supported(type, parser) or not argument.has_static_type):
 			return {"error": "parameters must have supported explicit types"}
 		params[name] = type
 		if argument.assignment != "":
 			defaults[name] = _default(parser, argument.assignment, function.declaration_line)
 	var return_type := Body.TypeInfo.normalize(function.get_return_type_raw(), parser, function.declaration_line)
-	if not Body.TypeInfo.supported(return_type, parser):
+	if return_type == "":
+		return_type = "Variant"
+	if not Body.TypeInfo.supported(return_type, parser) and not _direct_type(return_type):
 		return {"error": "a supported explicit return type is required"}
 	var statements:Array = []
 	var state := {"quote": "", "depth": 0, "cont": false}
@@ -85,16 +90,50 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 				base_indent = indent
 			statements.append({"code": code, "text": line.substr(base_indent), "line": index, "indent": indent - base_indent})
 	var direct:Dictionary = {}
-	if statements.size() == 1 and statements[0].code.begins_with("return "):
-		var expression:String = statements[0].code.trim_prefix("return ")
-		var analyzed := Arithmetic.new().analyze(expression, params)
-		if analyzed.error == "" and analyzed.type == return_type:
-			direct = {"tokens": analyzed.tokens}
+	var logical := _single_return(statements, parser, lines)
+	if logical != "":
+		var analyzed := _expression(logical, params, parser, statements[0].line)
+		if analyzed.error == "" and _direct_return(analyzed.type, return_type):
+			direct = {"expression": logical}
 	var assessed := Body.assess(parser, statements, params, return_type)
-	if assessed.has("error"):
-		return assessed
-	assessed.merge({"file": tag.file, "params": params, "defaults": defaults, "return_type": return_type, "direct": direct, "indent_width": base_indent})
+	var template_eligible:bool = not assessed.has("error") and Body.TypeInfo.supported(return_type, parser)
+	for type:String in params.values():
+		template_eligible = template_eligible and Body.TypeInfo.supported(type, parser)
+	if not template_eligible:
+		if direct.is_empty():
+			return assessed if assessed.has("error") else {"error": "unsupported template signature or direct expression"}
+		assessed = {}
+	assessed.merge({"file": tag.file, "params": params, "defaults": defaults, "return_type": return_type,
+		"direct": direct, "template_eligible": template_eligible, "indent_width": base_indent})
 	return assessed
+
+
+func _direct_type(type:String) -> bool:
+	return DirectExpression.admitted(type, _context.inline_functions_allow_ref_counted, _context.inline_functions_allow_variants)
+
+
+func _direct_return(actual:String, expected:String) -> bool:
+	return actual == expected or (_context.inline_functions_allow_variants and "Variant" in [actual, expected])
+
+
+func _expression(source:String, params:Dictionary, parser, line:int, column:int = -1) -> Dictionary:
+	return DirectExpression.new().analyze(source, params, parser, line, column,
+		_context.inline_functions_allow_ref_counted, _context.inline_functions_allow_variants)
+
+
+func _single_return(statements:Array, parser, lines:PackedStringArray) -> String:
+	if statements.is_empty() or not statements[0].code.begins_with("return "):
+		return ""
+	var source := "\n".join(lines.slice(statements[0].line, statements[-1].line + 1)).strip_edges().trim_prefix("return ")
+	var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(source)
+	# Keep literal bytes, including blank lines; remove comments by their token offsets.
+	for index in range(tokens.size() - 1, -1, -1):
+		var token:Dictionary = tokens[index]
+		if token.text == "\n" and token.depth == 0:
+			return ""
+		if token.text == "comment" and source[token.offset] == "#":
+			source = source.substr(0, token.offset) + source.substr(token.end)
+	return source
 
 
 func _default(parser, expression:String, line:int) -> Dictionary:
@@ -241,39 +280,39 @@ func _direct(site:Dictionary, parser, call:Dictionary) -> String:
 	var definition:Dictionary = call.definition
 	if definition.direct.is_empty() or call.explicit_count != call.args.size():
 		return ""
-	var args:Array = call.args
-	var locals:Dictionary = call.locals
-	var function = call.function
 	var bindings:Dictionary = {}
 	var types:Dictionary = {}
 	var names:Array = definition.params.keys()
-	for i in args.size():
-		var argument:String = args[i].strip_edges()
+	for i in call.args.size():
+		var argument:String = call.args[i].strip_edges()
 		var type := ""
-		if argument.is_valid_ascii_identifier():
-			var data:Dictionary = locals.get(argument, {})
-			if not data.has("has_static_type"):
-				# Scope scans carry locations; declaration metadata carries static typing.
-				for declaration:Dictionary in function.local_vars.values():
-					if declaration.member_name == argument and declaration.line_index == data.get("line_index", -1):
-						data = declaration
-						break
-			if not data.get("has_static_type", false):
+		if argument.is_valid_ascii_identifier() and argument not in ["true", "false", "null"]:
+			if not call.locals.has(argument):
 				return ""
-			type = parser.resolve_expression_to_type(argument, site.line, site.column)
-			if type.contains(_context.parser_script.Keys.TYPE_DELIM):
-				type = type.get_slice(_context.parser_script.Keys.TYPE_DELIM, 1)
+			var data := _local_data(call, argument)
+			type = Body.type_of(parser, argument, site.line, site.column) if data.get("has_static_type", false) else "Variant"
+			if type == "":
+				type = "Variant"
 			types[argument] = type
 		else:
-			if not argument.is_valid_int() and not argument.is_valid_float():
+			var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(argument)
+			var literal:bool = argument.is_valid_int() or argument.is_valid_float() or argument in ["true", "false", "null"]
+			literal = literal or (tokens.size() == 1 and tokens[0].text == "string" and argument[0] in ['"', "'"])
+			if not literal:
 				return ""
-			type = "int" if argument.is_valid_int() else "float"
-		if type != definition.params[names[i]]:
+			var analyzed := _expression(argument, {}, parser, site.line, site.column)
+			if analyzed.error != "":
+				return ""
+			type = analyzed.type
+		var expected:String = definition.params[names[i]]
+		if not _direct_type(type) or not _direct_type(expected) or not _direct_return(type, expected):
 			return ""
-		bindings[names[i]] = argument
-	var expanded := Arithmetic.render(definition.direct.tokens, bindings)
-	var checked := Arithmetic.new().analyze(expanded, types)
-	return expanded if checked.error == "" and checked.type == definition.return_type else ""
+		bindings[names[i]] = "(" + argument + ")"
+	var expanded:String = "(" + Body.rename(parser, definition.direct.expression, bindings) + ")"
+	var checked := _expression(expanded, types, parser, site.line, site.column)
+	if checked.error != "":
+		site.reason = checked.error
+	return expanded if checked.error == "" and _direct_return(checked.type, definition.return_type) else ""
 
 
 func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
@@ -283,6 +322,8 @@ func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 	var direct := _direct(site, parser, call)
 	if direct != "":
 		return {"start": site.start, "end": site.end, "text": direct, "mode": "direct", "stats": {"inline_substituted_args": call.args.size()}}
+	if not call.definition.template_eligible:
+		return {}
 	var line_start:int = source.rfind("\n", site.start - 1) + 1
 	var line_end:int = source.find("\n", site.end)
 	if line_end < 0:
