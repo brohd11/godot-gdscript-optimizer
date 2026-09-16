@@ -9,6 +9,7 @@ var plans:Dictionary = {}
 var _definitions:Dictionary = {}
 var _tagged:Dictionary = {}
 var _names:Dictionary = {}
+var _snapshots:Dictionary = {}
 var _context
 
 
@@ -18,6 +19,7 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 	_tagged.clear()
 	_names.clear()
 	_context = context
+	_snapshots = context.source_snapshots.duplicate()
 	var errors:Array = []
 	var warnings:Array = []
 	for key:String in sources:
@@ -27,7 +29,7 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 		if not FileAccess.file_exists(path):
 			errors.append("%s: source file does not exist" % path)
 			continue
-		var lines := FileAccess.get_file_as_string(path).split("\n")
+		var lines:PackedStringArray = _snapshots.get(path, FileAccess.get_file_as_string(path)).split("\n")
 		var tags:Array = Registry.scan_lines(lines, path).filter(func(entry): return entry.tag == "inline")
 		if tags.is_empty():
 			continue
@@ -58,43 +60,87 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 	if function == null or not function.is_static():
 		return {"error": "only static functions are supported"}
 	var params:Dictionary = {}
+	var defaults:Dictionary = {}
 	for name:String in function.get_arguments():
 		var argument:Dictionary = function.get_arguments()[name]
-		if argument.type not in Body.TYPES or not argument.has_static_type or argument.assignment != "":
-			return {"error": "parameters must be explicit built-in value types without defaults"}
-		params[name] = argument.type
-	var return_type:String = function.get_return_type_raw().trim_suffix(_context.parser_script.Keys.INS_DELIM)
-	if return_type not in Body.TYPES:
-		return {"error": "an explicit built-in value return type is required"}
+		var type := Body.TypeInfo.normalize(argument.type, parser, function.declaration_line)
+		if not Body.TypeInfo.supported(type, parser) or not argument.has_static_type:
+			return {"error": "parameters must have supported explicit types"}
+		params[name] = type
+		if argument.assignment != "":
+			defaults[name] = _default(parser, argument.assignment, function.declaration_line)
+	var return_type := Body.TypeInfo.normalize(function.get_return_type_raw(), parser, function.declaration_line)
+	if not Body.TypeInfo.supported(return_type, parser):
+		return {"error": "a supported explicit return type is required"}
 	var statements:Array = []
 	var state := {"quote": "", "depth": 0, "cont": false}
+	var base_indent := -1
 	for index in range(function.declaration_line + 1, function.end_line + 1):
 		var line:String = lines[index]
 		var comment := Registry.scan_code(line, state)
 		var code := (line.substr(0, comment) if comment >= 0 else line).strip_edges()
 		if not code.is_empty():
-			statements.append({"code": code, "text": line.strip_edges(), "line": index})
+			var indent := line.length() - line.strip_edges(true, false).length()
+			if base_indent < 0:
+				base_indent = indent
+			statements.append({"code": code, "text": line.substr(base_indent), "line": index, "indent": indent - base_indent})
 	var direct:Dictionary = {}
 	if statements.size() == 1 and statements[0].code.begins_with("return "):
 		var expression:String = statements[0].code.trim_prefix("return ")
 		var analyzed := Arithmetic.new().analyze(expression, params)
 		if analyzed.error == "" and analyzed.type == return_type:
 			direct = {"tokens": analyzed.tokens}
-	var assessed:Dictionary
-	if not direct.is_empty():
-		assessed = {"body": [{"text": statements[0].text, "return": true}], "symbols": params, "globals": {}}
-	else:
-		assessed = Body.assess(parser, statements, params, return_type)
-		if assessed.has("error"):
-			return assessed
-	return {"file": tag.file, "params": params, "return_type": return_type,
-		"direct": direct, "body": assessed.body, "symbols": assessed.symbols, "globals": assessed.globals}
+	var assessed := Body.assess(parser, statements, params, return_type)
+	if assessed.has("error"):
+		return assessed
+	assessed.merge({"file": tag.file, "params": params, "defaults": defaults, "return_type": return_type, "direct": direct, "indent_width": base_indent})
+	return assessed
+
+
+func _default(parser, expression:String, line:int) -> Dictionary:
+	var data := {"expression": expression, "globals": {}, "supported": false}
+	var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(expression)
+	for i in tokens.size():
+		var token:Dictionary = tokens[i]
+		if expression.substr(token.offset, token.end - token.offset) != token.text:
+			continue
+		if token.text in ["[", "{", "await", "func"]:
+			return data
+		if i + 1 < tokens.size() and tokens[i + 1].text == "(" and token.text not in Body.TYPES:
+			return data
+		if i > 1 and tokens[i - 1].text == ".":
+			var start := Body._receiver_start(tokens, i - 2)
+			var receiver := expression.substr(tokens[start].offset, tokens[i - 1].offset - tokens[start].offset)
+			var receiver_type := Body.type_of(parser, receiver, line)
+			if receiver_type.contains(".gd"):
+				var parts := receiver_type.split("::", true, 1)
+				var dependency = parser.get_parser_for_path(parts[0])
+				var owner = dependency.get_class_object(parts[1] if parts.size() > 1 else "")
+				var member:Variant = owner.get_member_data(token.text, true)
+				if member == null or member.get("member_type") not in [parser.Keys.MEMBER_TYPE_CONST, parser.Keys.MEMBER_TYPE_ENUM]:
+					return data
+	var metadata := {"symbols": {}, "uses": {}, "globals": {}, "effectful": false}
+	if Body._expression(parser, expression, line, metadata) != "":
+		return data
+	var type := Body.type_of(parser, expression, line)
+	if expression != "null" and type not in Body.TYPES:
+		return data
+	for name:String in metadata.globals:
+		var global:Dictionary = metadata.globals[name]
+		if not global.is_empty() and Body.type_of(parser, name, line) not in Body.TYPES:
+			var raw:String = parser.resolve_expression_to_type(name, line)
+			if not raw.ends_with(".gd"):
+				return data
+	data.supported = true
+	data.type = type
+	data.globals = metadata.globals
+	return data
 
 
 
 func apply(key:String, input_lines:Array) -> Dictionary:
 	var result := {"lines": input_lines, "errors": [], "warnings": [],
-		"stats": {"inline_calls": 0, "inline_skipped": 0, "inline_direct_calls": 0, "inline_expanded_calls": 0}}
+		"stats": {"inline_calls": 0, "inline_skipped": 0, "inline_direct_calls": 0, "inline_expanded_calls": 0, "inline_substituted_args": 0, "inline_captured_args": 0, "inline_repeated_access_captures": 0}}
 	if not plans.has(key):
 		return result
 	var path:String = plans[key]
@@ -134,11 +180,13 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 			replacement = _expand(site, parser, path, source)
 		if replacement.is_empty():
 			result.stats.inline_skipped += 1
-			result.warnings.append("%s:%d: inline candidate %s left unchanged (unsupported or unresolved call)" % [path, site.line + 1, site.callee])
+			result.warnings.append("%s:%d: inline candidate %s left unchanged (%s)" % [path, site.line + 1, site.callee, site.get("reason", "unsupported or unresolved call")])
 		else:
 			edits.append(replacement)
 			result.stats["inline_" + replacement.mode + "_calls"] += 1
 			result.stats.inline_calls += 1
+			for name:String in replacement.get("stats", {}):
+				result.stats[name] += replacement.stats[name]
 	_dispose(parser)
 	edits.reverse()
 	for edit:Dictionary in edits:
@@ -178,14 +226,20 @@ func _resolve_call(site:Dictionary, parser, path:String) -> Dictionary:
 	var args:Array = _context.parser_script.Utils.GDScriptParse.safe_split_args(site.args)
 	if site.args.strip_edges().is_empty():
 		args = []
-	if args.size() != definition.params.size():
+	if args.size() > definition.params.size():
 		return {}
-	return {"definition": definition, "function": function, "locals": locals, "args": args}
+	var explicit_count := args.size()
+	for name:String in definition.params.keys().slice(explicit_count):
+		if not definition.defaults.has(name) or not definition.defaults[name].supported:
+			site.reason = "missing required argument or unsupported omitted default: " + name
+			return {}
+		args.append(definition.defaults[name].expression)
+	return {"definition": definition, "function": function, "locals": locals, "args": args, "explicit_count": explicit_count}
 
 
 func _direct(site:Dictionary, parser, call:Dictionary) -> String:
 	var definition:Dictionary = call.definition
-	if definition.direct.is_empty():
+	if definition.direct.is_empty() or call.explicit_count != call.args.size():
 		return ""
 	var args:Array = call.args
 	var locals:Dictionary = call.locals
@@ -228,8 +282,7 @@ func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 		return {}
 	var direct := _direct(site, parser, call)
 	if direct != "":
-		return {"start": site.start, "end": site.end, "text": direct, "mode": "direct"}
-	var definition:Dictionary = call.definition
+		return {"start": site.start, "end": site.end, "text": direct, "mode": "direct", "stats": {"inline_substituted_args": call.args.size()}}
 	var line_start:int = source.rfind("\n", site.start - 1) + 1
 	var line_end:int = source.find("\n", site.end)
 	if line_end < 0:
@@ -242,60 +295,163 @@ func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 		return {}
 	var statement := prefix.strip_edges()
 	var target := RegEx.new()
-	target.compile(r"^(?:var\s+[A-Za-z_][A-Za-z_0-9]*(?:\s*:\s*[A-Za-z_][A-Za-z_0-9]*)?\s*:?=|([A-Za-z_][A-Za-z_0-9]*)\s*=|return)$")
+	target.compile(r"^(?:var\s+[A-Za-z_][A-Za-z_0-9]*(?:\s*:\s*[A-Za-z_][A-Za-z_0-9.\[\], ]*)?\s*:?=|([A-Za-z_][A-Za-z_0-9]*)\s*=|return)$")
 	var match_target := target.search(statement)
 	if match_target == null:
 		return {}
 	if match_target.get_string(1) != "" and not call.locals.has(match_target.get_string(1)):
 		return {}
-	var caller = parser.get_class_object(parser.get_class_at_line(site.line))
-	var required:Dictionary = definition.globals.duplicate()
-	for type:String in definition.symbols.values() + [definition.return_type]:
-		required[type] = true
-	for name:String in required:
-		if call.locals.has(name) or caller.get_member_data(name, true) != null:
-			return {}
-	var names:Array = definition.params.keys()
-	for i in call.args.size():
-		var argument:String = call.args[i].strip_edges()
-		var argument_tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(argument)
-		if argument_tokens.any(func(token): return token.text in ["await", "func"]):
-			return {}
-		for index in argument_tokens.size():
-			var token:Dictionary = argument_tokens[index]
-			if (call.locals.has(token.text) and (index == 0 or argument_tokens[index - 1].text != ".")
-					and argument.substr(token.offset, token.end - token.offset) == token.text):
-				var data:Dictionary = call.locals[token.text]
-				if not data.has("has_static_type"):
-					for declaration:Dictionary in call.function.local_vars.values():
-						if declaration.member_name == token.text and declaration.line_index == data.get("line_index", -1):
-							data = declaration
-							break
-				if not data.get("has_static_type", false):
-					return {}
-		var type := Body.type_of(parser, argument, site.line, site.column)
-		if type not in Body.TYPES or not Body.compatible(type, definition.params[names[i]]):
-			return {}
 	var unique := "_inline_%d_" % site.start
 	while source.contains(unique):
 		unique += "_"
+	return _render_template(site, parser, call, unique, prefix, suffix, line_start, line_end)
+
+
+func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, prefix:String, suffix:String, start:int, end:int) -> Dictionary:
+	var definition:Dictionary = call.definition
+	var aliases := {"prefix": unique}
 	var bindings:Dictionary = {}
+	var captures:Array = []
+	var stats := {"inline_substituted_args": 0, "inline_captured_args": 0, "inline_repeated_access_captures": 0}
+	var caller = parser.get_class_object(parser.get_class_at_line(site.line))
+	for name:String in definition.globals:
+		var global:Dictionary = definition.globals[name]
+		if global.is_empty():
+			if call.locals.has(name) or caller.get_member_data(name, true) != null:
+				site.reason = "built-in name is shadowed: " + name
+				return {}
+		else:
+			bindings[name] = _global(global, parser, aliases)
+	var names:Array = definition.params.keys()
+	for i in call.args.size():
+		var name:String = names[i]
+		var argument:String = call.args[i].strip_edges()
+		var expected:String = definition.params[name]
+		var is_default:bool = i >= call.explicit_count
+		if is_default:
+			var globals:Dictionary = {}
+			for key:String in definition.defaults[name].globals:
+				var global:Dictionary = definition.defaults[name].globals[key]
+				if not global.is_empty():
+					globals[key] = _global(global, parser, aliases)
+				elif call.locals.has(key) or caller.get_member_data(key, true) != null:
+					site.reason = "default built-in name is shadowed: " + key
+					return {}
+			argument = Body.rename(parser, argument, globals)
+		var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(argument)
+		if tokens.any(func(token): return token.text in ["await", "func"]):
+			site.reason = "argument uses await or a lambda"
+			return {}
+		var actual:String = definition.defaults[name].type if is_default else Body.type_of(parser, argument, site.line, site.column)
+		if not is_default:
+			if argument.is_valid_int():
+				actual = "int"
+			elif argument.is_valid_float():
+				actual = "float"
+			elif argument in ["true", "false"]:
+				actual = "bool"
+		var lookup := tokens.any(func(token): return token.text in [".", "["])
+		var stable := false
+		if not is_default and argument.is_valid_ascii_identifier() and call.locals.has(argument):
+			stable = _local_data(call, argument).get("has_static_type", false)
+			if not stable:
+				site.reason = "Variant local argument is unsupported; use a typed local or indexed lookup"
+				return {}
+		elif argument.is_valid_int() or argument.is_valid_float() or argument in ["true", "false", "null"]:
+			stable = true
+		elif tokens.size() == 1 and tokens[0].text == "string" and argument.begins_with('"'):
+			stable = true
+		if not Body.compatible(actual, expected):
+			if not (actual in ["", "Variant", "null"] or lookup or Body.TypeInfo.is_reference(expected)):
+				site.reason = "incompatible argument type for " + name
+				return {}
+		var usage:Dictionary = definition.uses[name]
+		var captured:bool = (not stable or actual != expected or usage.rebound
+			or (definition.runtime_arithmetic and (argument.is_valid_int() or argument.is_valid_float()))
+			or (usage.written and not Body.TypeInfo.is_reference(expected))
+			or (definition.effectful and Body.TypeInfo.is_reference(expected)))
+		# Object properties may have accessors; keep the original strong parameter reference.
+		if expected.contains(".gd") or expected == "RefCounted":
+			captured = true
+		if captured:
+			bindings[name] = unique + name
+			captures.append("var %s:%s = %s" % [bindings[name], Body.TypeInfo.emit(expected, parser, aliases), argument])
+			stats.inline_captured_args += 1
+			if lookup and usage.count > 1:
+				stats.inline_repeated_access_captures += 1
+		else:
+			bindings[name] = "(" + argument + ")"
+			stats.inline_substituted_args += 1
 	for name:String in definition.symbols:
-		bindings[name] = unique + name
+		if not definition.params.has(name):
+			bindings[name] = unique + name
 	var result_name := unique + "result"
 	while bindings.values().has(result_name):
 		result_name += "_"
+	var bridge := unique + "bridge"
+	while bindings.values().has(bridge) or bridge == result_name:
+		bridge += "_"
+	var return_type := Body.TypeInfo.emit(definition.return_type, parser, aliases)
 	var indent := prefix.substr(0, prefix.length() - prefix.strip_edges(true, false).length())
+	var unit := "\t"
+	if indent.contains(" "):
+		var source_lines:PackedStringArray = parser.code_edit.text.split("\n")
+		var declaration:String = source_lines[call.function.declaration_line]
+		var declaration_indent := declaration.length() - declaration.strip_edges(true, false).length()
+		for line_index in range(call.function.declaration_line + 1, site.line + 1):
+			var line:String = source_lines[line_index]
+			if not line.strip_edges().is_empty() and not line.strip_edges().begins_with("#"):
+				unit = " ".repeat(line.length() - line.strip_edges(true, false).length() - declaration_indent)
+				break
 	var lines:Array = []
-	for i in call.args.size():
-		lines.append(indent + "var %s:%s = %s" % [bindings[names[i]], definition.params[names[i]], call.args[i].strip_edges()])
+	var rendered:Array = []
 	for body:Dictionary in definition.body:
-		var text := Body.rename(parser, body.text, bindings)
+		var text:String = body.text
+		var slots:Array = body.tokens
+		if body.declared != "":
+			var annotation := RegEx.new()
+			annotation.compile(r"^((?:var|const)\s+[A-Za-z_][A-Za-z_0-9]*)\s*:\s*([^=]+)=")
+			var found := annotation.search(text.strip_edges())
+			if found != null:
+				text = text.replace(found.get_string(2), Body.TypeInfo.emit(body.type, parser, aliases) + " ")
+				slots = []
+		text = Body.rename(parser, text, bindings, slots)
+		text = unit.repeat(body.indent / definition.indent_width) + text.strip_edges(true, false)
 		if body["return"]:
-			text = "var %s:%s = %s" % [result_name, definition.return_type, text.trim_prefix("return ")]
-		lines.append(indent + text)
-	lines.append(prefix + result_name + suffix)
-	return {"start": line_start, "end": line_end, "text": "\n".join(lines), "mode": "expanded"}
+			var relative := text.substr(0, text.length() - text.strip_edges(true, false).length())
+			text = relative + result_name + " = " + text.strip_edges().trim_prefix("return ")
+		rendered.append(text)
+	for path:String in aliases:
+		if path != "prefix":
+			lines.append(indent + 'const %s = preload("%s")' % [aliases[path], path])
+	lines.append(indent + "var " + bridge + ":Variant")
+	lines.append(indent + "if true:")
+	for capture:String in captures:
+		lines.append(indent + unit + capture)
+	lines.append(indent + unit + "var %s:%s" % [result_name, return_type])
+	for text:String in rendered:
+		lines.append(indent + unit + text)
+	lines.append(indent + unit + "%s = %s" % [bridge, result_name])
+	# The typed cast retains := inference; the bridge is cleared after the caller consumes it.
+	lines.append(prefix + "(" + bridge + " as " + return_type + ")" + suffix)
+	if prefix.strip_edges() != "return":
+		lines.append(indent + bridge + " = null")
+	return {"start": start, "end": end, "text": "\n".join(lines), "mode": "expanded", "stats": stats}
+
+
+func _local_data(call:Dictionary, name:String) -> Dictionary:
+	var data:Dictionary = call.locals[name]
+	if not data.has("has_static_type"):
+		for declaration:Dictionary in call.function.local_vars.values():
+			if declaration.member_name == name and declaration.line_index == data.get("line_index", -1):
+				return declaration
+	return data
+
+
+func _global(global:Dictionary, parser, aliases:Dictionary) -> String:
+	if global.has("type"):
+		return Body.TypeInfo.emit(global.type, parser, aliases)
+	return Body.TypeInfo.dependency(global.file, aliases) + "." + global.name
 
 
 func _parser(path:String, source:String):
@@ -303,6 +459,7 @@ func _parser(path:String, source:String):
 	if script == null:
 		return null
 	var parser = _context.parser_script.new()
+	parser.set_source_provider(func(target:String): return _snapshots.get(target))
 	parser.set_use_native_backend(false)
 	parser.set_parser_cache({})
 	parser.set_parser_cache_size(-1)

@@ -18,7 +18,14 @@ func prepare(sources:Dictionary, context:Context, pass_scripts:Array = [StructPa
 	_passes = []
 	_files = {}
 	context.reset()
-	for pass_script:GDScript in pass_scripts:
+	var snapshots:Dictionary = {}
+	if InlinePass in pass_scripts:
+		for path:String in sources.values():
+			if path.get_extension() == "gd" and FileAccess.file_exists(path):
+				snapshots[path] = FileAccess.get_file_as_string(path)
+	for index in pass_scripts.size():
+		var pass_script:GDScript = pass_scripts[index]
+		context.source_snapshots = snapshots.duplicate()
 		var instance = pass_script.new()
 		var result:Dictionary = instance.prepare(sources, context)
 		errors.append_array(result.errors)
@@ -26,6 +33,12 @@ func prepare(sources:Dictionary, context:Context, pass_scripts:Array = [StructPa
 		_passes.append(instance)
 		for key:String in instance.plans:
 			_files[key] = true
+		if not snapshots.is_empty() and index < pass_scripts.size() - 1 and errors.is_empty():
+			for key:String in instance.plans:
+				var path:String = sources[key]
+				var staged:Dictionary = instance.apply(key, Array(snapshots[path].split("\n")))
+				errors.append_array(staged.errors)
+				snapshots[path] = "\n".join(staged.lines)
 	return {"errors": errors, "warnings": warnings}
 
 

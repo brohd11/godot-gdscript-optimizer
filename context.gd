@@ -11,6 +11,7 @@ var removed_globals:Dictionary = {}
 var map_path:Callable
 var scan_references:Callable
 var injection_header:String = "### GDScript Optimizer Structs"
+var source_snapshots:Dictionary = {}
 
 var _scanner
 var _references:Dictionary = {}
@@ -25,6 +26,7 @@ func set_global_classes(classes:Dictionary) -> void:
 
 
 func reset() -> void:
+	source_snapshots = {}
 	_references.clear()
 	_scanner = null
 
@@ -57,4 +59,3 @@ func references(path:String) -> Array:
 				paths.append(edge.to)
 	_references[path] = paths
 	return paths
-

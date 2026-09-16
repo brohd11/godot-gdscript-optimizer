@@ -1,7 +1,7 @@
 # GDScript Optimizer
 
 Shared source transforms for Godot build tools. `StructPass` lowers `#! struct`
-data classes to arrays. `InlinePass` expands supported tagged static arithmetic calls.
+data classes to arrays. `InlinePass` expands supported tagged static calls.
 It uses GDScriptParser and the shared dependency scanner through `utils_remote.gd`.
 Tag discovery and indexing use `addons/addon_lib/tag_parser`; the old
 `tag_registry.gd` remains a compatibility entry point.
@@ -34,8 +34,9 @@ errors prevent replay, and a failed replay returns the original input lines.
 A pass implements `prepare(sources, context)` returning `{errors, warnings}`, exposes
 `plans` keyed by affected file identity, and implements `apply(key, lines)` returning
 `{lines, errors}` with optional `warnings` and additive integer `stats`. The optimizer
-aggregates these diagnostics on successful replay. Passes run in the supplied order. Preparation sees original source;
-consumers must preserve planned locations until replay, or treat conflicts as errors.
+aggregates these diagnostics on successful replay. Passes run in the supplied order. With InlinePass selected, preparation stages preceding transforms in memory. Inline
+definitions and cross-file type resolution see the same post-struct snapshots.
+Consumers must preserve planned locations until replay, or treat conflicts as errors.
 No writes, export lifecycle methods, or editor reporting belong in a pass.
 
 ## Static function inlining
@@ -55,31 +56,51 @@ The direct path retains the numeric arithmetic grammar (`+ - * / %`, parentheses
 unary `+ -`) and substitutes matching numeric literals or statically typed locals.
 It emits no argument temporaries.
 
-The expanded path supports explicit built-in value parameter/return types, local
-initializers (`var` with a type or `:=`, and `const`), assignments to parameters or
-locals, and one final return. Expressions may use resolved built-in constructors,
-constants, functions, and value methods. Each statement must occupy one line.
-Supported types are bool, int, float, String, StringName, NodePath, Vector2/3/4 and
+The template path supports explicit built-in value types, Array/Dictionary (including
+typed collections), RefCounted, and typed RefCounted-derived scripts. Tagged structs
+work as objects with inline alone and as arrays with StructPass followed by InlinePass.
+Value types include bool, int, float, String, StringName, NodePath, Vector2/3/4 and
 integer variants, Rect2/Rect2i, Transform2D/3D, Plane, Quaternion, AABB, Basis,
-Projection, Color, and RID.
+Projection, Color, and RID. Node/raw Object and packed-array extensions are deferred.
 
-Expanded calls must be the entire expression in a local declaration, assignment to
-a simple local/parameter, or return. Argument expressions can include calls and
-property reads with statically resolved matching value types. Numeric int/float
-conversions are supported. Every argument, including unused ones, is bound once in
-order to a fresh typed local. Body parameters/locals are renamed; the final value
-is captured with the declared return type before completing the caller statement.
-For example, a helper using `var scaled := value * scale` and then returning
-`scaled.length_squared()` can accept a Vector2 expression and a float argument.
+Preflight records parameter token slots, reference counts, rebinding, field/index
+writes, and calls. Bodies may declare typed/inferred locals, assign locals/parameters
+or their fields, and finish with a return or an exhaustive terminal if/elif/else tree.
+Nested terminal branches are supported; every statement must occupy one line.
+Immutable constants and script/type aliases retain their defining scope.
+
+Replay chooses bindings separately for each parameter:
+
+- Matching typed locals and cheap literals can substitute directly into token slots.
+- Calls, properties and indexed arguments are evaluated once in argument order.
+  Repeated member/index reads therefore never duplicate expensive lookup work.
+- Reassigned parameters and mutated value-type arguments get typed local copies.
+  Arrays/dictionaries keep shared mutation; rebinding stays local to the call.
+- Script objects retain a strong local parameter reference, including unused parameters.
+  This preserves accessors, reference ownership and destructor timing.
+- Numeric conversions retain typed bindings. Effectful unused arguments still execute.
+
+Expanded calls must be the whole initializer of a local declaration, assignment to a
+simple local/parameter, or return. Argument/body locals live in a generated block.
+A typed result crosses that block through a temporary Variant, is cast back to retain
+`:=` inference, and the bridge is cleared after assignment. Imported locals therefore
+do not extend reference lifetimes to the end of the caller.
+
+Omitted defaults support literals/null, value constructors with constant inputs, and
+resolvable immutable value constants. Mutable collection or executable defaults leave
+the omitted-argument call unchanged; explicitly supplying that argument remains eligible.
 
 Calls use a script constant/global class, or a direct call inside another static
-function in the same script. Original function definitions remain intact.
-Collections, objects, Variant declarations, defaults, branches, loops, early
-returns, lambdas, await, script-member references in imported bodies, and nested
-inlining remain unsupported. Ambiguous names or unsupported sites stay unchanged
-with diagnostics. No expansion is hoisted out of a larger expression.
+function in the same script. Original definitions remain intact. Variant declarations,
+loops, arbitrary early returns, lambdas/await in imported bodies, mutable external
+bindings, and nested inlining remain unsupported. Ambiguous/unsupported sites stay
+unchanged with diagnostics. No expansion is hoisted from a larger expression.
+A single-iteration loop plus result/break for general early returns is a follow-up
+experiment; its control-flow cost needs a separate benchmark.
 
-Replay stats expose `inline_calls`, `inline_skipped`, `inline_direct_calls`, and
-`inline_expanded_calls`; counts describe source sites, not runtime invocations.
+Replay stats expose `inline_calls`, `inline_skipped`, `inline_direct_calls`,
+`inline_expanded_calls`, `inline_substituted_args`, `inline_captured_args`, and
+`inline_repeated_access_captures`. Counts describe source sites, not runtime invocations.
+Tagging is opt-in: removal of call overhead does not guarantee a speedup for every body.
 
 Tests: `godot --headless --path . --script res://tests/gdscript_optimizer/run_headless.gd`.
