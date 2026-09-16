@@ -45,6 +45,7 @@ No writes, export lifecycle methods, or editor reporting belong in a pass.
 context.scalar_replacement = true
 context.struct_read_types = Optimizer.Context.StructReadTypes.TYPED_LOCALS
 # Alternatives: OFF (default), AS_CASTS.
+context.allow_ref_counted = false # Explicit opt-in for reference field locals/casts.
 ```
 
 These settings extend `StructPass`; neither changes default output. Scalar replacement
@@ -54,7 +55,7 @@ built-in value type (explicit or `:=`). It supports branches, loops, field assig
 compound updates, and value-component writes. Constructor arguments evaluate once in order
 before parameter conversions. Field initialization and conversion remain typed.
 
-Reference/dynamic fields, aliases, reassignment, whole-value uses, captures, coroutines,
+By default, reference/dynamic fields, aliases, reassignment, whole-value uses, captures, coroutines,
 multiline constructors, and unresolved/effectful defaults stay in the existing Array form.
 Supported defaults are literals and built-in value constructors with immutable inputs.
 Scalarization after inline expansion is deferred.
@@ -63,7 +64,25 @@ For remaining field reads, `TYPED_LOCALS` inserts typed captures only at support
 sites with safe evaluation order. It skips conditional/multiline evaluation, mixed calls,
 complex receivers, and writes. `AS_CASTS` wraps reads in `(receiver[S.FIELD] as T)` without
 moving them; it skips writes, multiline statements, and inline lambdas/semicolon statements.
-Both use the same built-in value types as the inliner. No repeated-read caching is performed.
+By default both use the same built-in value types as the inliner. No repeated-read caching is performed.
+
+`allow_ref_counted = true` admits known Object/Node/RefCounted and script types,
+collections, packed arrays, Callable, Signal, and nested structs in both optimizations.
+This opt-in can prolong reference lifetimes and add runtime checks on freed objects.
+Escape/evaluation-order checks and the inliner's type rules remain unchanged. Scalar
+initializers additionally accept null, literal collections, and empty built-in constructors;
+mutable defaults are created per instance. Effectful or incompatible defaults still skip.
+Cross-file type names use dependency aliases and output-path mapping; nested structs emit
+Array. Surviving collection reads use Array/Dictionary because lowering can erase element
+metadata; scalar declarations preserve typed collections. Unknown types are skipped.
+
+`Optimizer.Config.from_file(path = "")` loads one YAML mapping using the required YAMLParser dependency,
+returning `{options, errors}`. `from_dictionary(data)` validates an in-memory mapping.
+Export defaults enable structs, inline_functions, scalar_replacement, and typed_locals;
+allow_ref_counted stays false. Missing keys inherit defaults, and invalid/unknown options
+produce errors with no usable options. `struct_read_types` accepts off, typed_locals,
+or as_casts and normalizes to the Context enum. Context and prepare defaults are unchanged;
+other hosts must explicitly select these export defaults.
 
 Stats are `scalar_structs`, `scalar_accesses`, `scalar_skipped`, `struct_typed_captures`,
 `struct_read_casts`, and `struct_reads_skipped`. They count source sites, not runtime work.

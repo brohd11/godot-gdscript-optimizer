@@ -16,6 +16,9 @@ var _types
 var _lines:PackedStringArray
 var _tokens:Array
 var _mode:int
+var _allow_references:bool
+var type_dependencies:Dictionary = {}
+var _source:String
 var _prefix:String
 var _codes:PackedStringArray = []
 var _complete:Dictionary = {}
@@ -25,6 +28,8 @@ func _init(lines:PackedStringArray, types, context) -> void:
 	_lines = lines
 	_types = types
 	_mode = context.struct_read_types
+	_allow_references = context.allow_ref_counted
+	_source = types.parser.get_script_path()
 	var source := "\n".join(lines)
 	_prefix = "_struct_opt_"
 	while source.contains(_prefix):
@@ -54,10 +59,48 @@ func field_type(path:String, field:String) -> String:
 		var declaration:Variant = parser.Utils.get_var_or_const_info(parser.code_edit.get_line(item.line).strip_edges())
 		if declaration != null and (item.type != "" or declaration[3]):
 			result = owner.get_member_type(field).trim_suffix(parser.Keys.INS_DELIM)
-			if result not in ValueTypes.VALUES:
+			if not _supported_type(result):
 				result = ""
 	_field_types[key] = result
 	return result
+
+
+func _supported_type(type:String) -> bool:
+	if type in ValueTypes.VALUES:
+		return true
+	if not _allow_references or type in ["", "Variant", "null"]:
+		return false
+	if type.contains("["):
+		if type.get_slice("[", 0) not in ["Array", "Dictionary"]:
+			return false
+		for arg:String in _types.parser.Utils.GDScriptParse.safe_split_args(type.substr(type.find("[") + 1).trim_suffix("]")):
+			if arg.strip_edges() != "Variant" and not _supported_type(arg.strip_edges()):
+				return false
+		return true
+	return type.contains(".gd") or ClassDB.class_exists(type) or _types._variant_types().has(type)
+
+
+func _emit_type(type:String) -> String:
+	if _types.structs.has(type):
+		return "Array"
+	if type.contains("["):
+		var parts:Array[String] = []
+		for arg:String in _types.parser.Utils.GDScriptParse.safe_split_args(type.substr(type.find("[") + 1).trim_suffix("]")):
+			var element := _emit_type(arg.strip_edges())
+			if element.is_empty():
+				return ""
+			parts.append(element)
+		return type.get_slice("[", 0) + "[" + ", ".join(parts) + "]"
+	if type.contains(".gd"):
+		var end := type.find(".gd", type.rfind("/") + 1) + 3
+		var path := type.substr(0, end)
+		var tail := type.substr(end).trim_prefix(".").trim_prefix("::").replace("::", ".")
+		if path == _source:
+			return tail
+		if not type_dependencies.has(path):
+			type_dependencies[path] = _prefix + "type_%d" % type_dependencies.size()
+		return type_dependencies[path] + ("." + tail if tail != "" else "")
+	return type
 
 
 func _function(line:int):
@@ -105,8 +148,10 @@ func _find_scalars() -> void:
 			continue
 		var candidate := {"line": line, "name": found.get_string(1), "path": path,
 			"fields": {}, "function": function, "args": found.get_string(3)}
+		var dependencies := type_dependencies.duplicate()
 		var reason := _assess(candidate)
 		if reason != "":
+			type_dependencies = dependencies
 			stats.scalar_skipped += 1
 			warnings.append("line %d: scalar %s skipped (%s)" % [line + 1, candidate.name, reason])
 		else:
@@ -119,8 +164,11 @@ func _assess(candidate:Dictionary) -> String:
 	for field:Dictionary in def.fields:
 		var type := field_type(candidate.path, field.name)
 		if type.is_empty():
-			return "field %s has a dynamic or reference type" % field.name
-		candidate.fields[field.name] = {"type": type,
+			return "field %s has an unsupported or dynamic type" % field.name
+		var emitted := _emit_type(type)
+		if emitted.is_empty():
+			return "unrepresentable field type"
+		candidate.fields[field.name] = {"type": emitted,
 			"name": _prefix + "%d_%s" % [candidate.line, field.name]}
 	var function = candidate.function
 	for index in _tokens.size():
@@ -165,8 +213,14 @@ func _initialize(candidate:Dictionary, def:Dictionary) -> String:
 		if info == null:
 			return ""
 		var type:String = info[1]
-		if type != "" and type not in ValueTypes.VALUES:
-			return ""
+		if type != "":
+			var parser = _types.parser.get_parser_for_path(def.file)
+			type = ValueTypes.normalize(type, parser, def.body_start)
+			if not _supported_type(type):
+				return ""
+			type = _emit_type(type)
+			if type.is_empty():
+				return ""
 		var value:String = args[index] if index < args.size() else info[2]
 		if value.is_empty() or (index >= args.size() and not _immutable(value)):
 			return ""
@@ -181,6 +235,8 @@ func _initialize(candidate:Dictionary, def:Dictionary) -> String:
 		if not _immutable(field.fill):
 			return ""
 		var local:Dictionary = candidate.fields[field.name]
+		if local.type.begins_with("Array") and field.fill == "null":
+			return ""
 		out.append(indent + "var %s: %s = %s" % [local.name, local.type, field.fill])
 	for index in def.arg_slots.size():
 		var local:Dictionary = candidate.fields[def.fields[def.arg_slots[index]].name]
@@ -189,6 +245,21 @@ func _initialize(candidate:Dictionary, def:Dictionary) -> String:
 
 
 func _immutable(expression:String) -> bool:
+	if _allow_references:
+		if expression == "null":
+			return true
+		if expression in ["[]", "{}"]:
+			return true
+		if expression.begins_with("[") and expression.ends_with("]"):
+			return Rewrite._split_args(expression.substr(1, expression.length() - 2)).all(func(item): return _immutable(item))
+		if expression.begins_with("{") and expression.ends_with("}"):
+			for entry:String in Rewrite._split_args(expression.substr(1, expression.length() - 2)):
+				var pair:Array = _dictionary_pair(entry)
+				if pair.size() != 2 or not _immutable(pair[0].strip_edges()) or not _immutable(pair[1].strip_edges()):
+					return false
+			return true
+		if expression.ends_with("()") and expression.trim_suffix("()") in ["Array", "Dictionary", "Callable", "Signal", "PackedByteArray", "PackedInt32Array", "PackedInt64Array", "PackedFloat32Array", "PackedFloat64Array", "PackedStringArray", "PackedVector2Array", "PackedVector3Array", "PackedVector4Array", "PackedColorArray"]:
+			return true
 	var tokens:Array = _types.parser.CodeEditParser.LambdaScanner._tokens(expression)
 	if tokens.is_empty():
 		return false
@@ -214,6 +285,18 @@ func _immutable(expression:String) -> bool:
 	return true
 
 
+func _dictionary_pair(entry:String) -> Array:
+	var depth := 0
+	for token:Dictionary in _types.parser.CodeEditParser.LambdaScanner._tokens(entry):
+		if token.text in ["[", "{", "("]:
+			depth += 1
+		elif token.text in ["]", "}", ")"]:
+			depth -= 1
+		elif token.text == ":" and depth == 0:
+			return [entry.substr(0, token.offset), entry.substr(token.end)]
+	return []
+
+
 func replacement(path:String, field:String, receiver:String, lowered:String, line:int, start:int, end:int) -> String:
 	if receiver.is_valid_ascii_identifier():
 		var binding := _binding(receiver, line, start)
@@ -235,19 +318,26 @@ func replacement(path:String, field:String, receiver:String, lowered:String, lin
 		stats.struct_reads_skipped += 1
 		return lowered
 	var suffix := code.substr(end).strip_edges()
-	if _explicit_cast(code, start, end, type):
+	if _explicit_cast(code, start, end, type, line):
+		return lowered
+	if _mode == 1:
+		if not _capture_safe(code, receiver, line):
+			stats.struct_reads_skipped += 1
+			warnings.append("line %d: typed field capture skipped (evaluation order or unsupported statement)" % [line + 1])
+			return lowered
+		var declaration := RegEx.create_from_string(r"^\s*var\s+\w+\s*:\s*([\w.\[\], ]*)\s*=\s*")
+		var found := declaration.search(code)
+		if found != null and found.get_end() == start and suffix == "":
+			var destination := found.get_string(1).strip_edges()
+			if destination == "" or ValueTypes.normalize(destination, _types.parser, line) == type:
+				return lowered
+	# Struct lowering can erase collection element metadata; keep the container type.
+	type = type.get_slice("[", 0) if type.contains("[") else _emit_type(type)
+	if type.is_empty():
 		return lowered
 	if _mode == 2:
 		stats.struct_read_casts += 1
 		return "(%s as %s)" % [lowered, type]
-	if not _capture_safe(code, receiver, line):
-		stats.struct_reads_skipped += 1
-		warnings.append("line %d: typed field capture skipped (evaluation order or unsupported statement)" % [line + 1])
-		return lowered
-	var declaration := RegEx.create_from_string(r"^\s*var\s+\w+\s*:\s*(\w*)\s*=\s*")
-	var found := declaration.search(code)
-	if found != null and found.get_end() == start and suffix == "" and found.get_string(1) in ["", type]:
-		return lowered
 	var name := _prefix + "read_%d_%d" % [line, start]
 	var indent := code.substr(0, Rewrite._indent_of(code))
 	prefixes.get_or_add(line, []).append(indent + "var %s: %s = %s" % [name, type, lowered])
@@ -255,7 +345,7 @@ func replacement(path:String, field:String, receiver:String, lowered:String, lin
 	return name
 
 
-func _explicit_cast(code:String, start:int, end:int, type:String) -> bool:
+func _explicit_cast(code:String, start:int, end:int, type:String, line:int) -> bool:
 	var before := start - 1
 	var after := end
 	while true:
@@ -279,7 +369,8 @@ func _explicit_cast(code:String, start:int, end:int, type:String) -> bool:
 					break
 		before -= 1
 		after += 1
-	return RegEx.create_from_string("^as\\s+" + type + "\\b").search(code.substr(after).strip_edges()) != null
+	var found := RegEx.create_from_string(r"^as\s+([\w.]+(?:\[[^\]]+\])?)").search(code.substr(after).strip_edges())
+	return found != null and ValueTypes.normalize(found.get_string(1), _types.parser, line) == type
 
 
 func _write_target(code:String, start:int, end:int) -> bool:

@@ -12,6 +12,7 @@ var structs:Dictionary = {}
 var _parser_cache:Dictionary = {}
 var _warnings:Array = []
 var _context
+var _source_keys:Dictionary = {}
 
 
 func prepare(sources:Dictionary, context) -> Dictionary:
@@ -20,6 +21,9 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 	_parser_cache.clear()
 	_warnings.clear()
 	_context = context
+	_source_keys.clear()
+	for key:String in sources:
+		_source_keys[sources[key]] = key
 	var registry = TagRegistry.new()
 	var errors:Array = []
 	for key:String in sources:
@@ -108,6 +112,8 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 		ops.get_or_add(line, []).append_array(result.ops[line])
 	if optimization != null:
 		optimization.finish(result.lines, ops)
+		for path:String in optimization.type_dependencies:
+			injected[optimization.type_dependencies[path]] = {"key": _source_keys.get(path, path), "tail": ""}
 		for warning:String in optimization.warnings:
 			_warnings.append("%s: %s" % [source, warning])
 

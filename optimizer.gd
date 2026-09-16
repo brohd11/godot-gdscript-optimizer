@@ -3,6 +3,7 @@ extends RefCounted
 ## or render every file up front before committing any output.
 
 const Context = preload("res://addons/addon_lib/gdscript_optimizer/context.gd")
+const Config = preload("res://addons/addon_lib/gdscript_optimizer/config.gd")
 const StructPass = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct_pass.gd")
 const InlinePass = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline_pass.gd")
 

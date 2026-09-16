@@ -15,6 +15,7 @@ var scan_references:Callable
 var injection_header:String = "### GDScript Optimizer Structs"
 var source_snapshots:Dictionary = {}
 var scalar_replacement:bool = false
+var allow_ref_counted:bool = false
 var struct_read_types:StructReadTypes = StructReadTypes.OFF
 
 var _scanner
