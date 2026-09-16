@@ -4,6 +4,7 @@ extends RefCounted
 
 const Context = preload("res://addons/addon_lib/gdscript_optimizer/context.gd")
 const StructPass = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct_pass.gd")
+const InlinePass = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline_pass.gd")
 
 var errors:Array = []
 var warnings:Array = []
@@ -38,9 +39,14 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 	if not errors.is_empty():
 		return {"lines": input_lines, "errors": errors}
 	var lines = input_lines.duplicate()
+	var diagnostics:Array = []
+	var stats:Dictionary = {}
 	for instance in _passes:
 		var result:Dictionary = instance.apply(key, lines)
 		if not result.errors.is_empty():
 			return {"lines": input_lines, "errors": result.errors}
 		lines = result.lines
-	return {"lines": lines, "errors": []}
+		diagnostics.append_array(result.get("warnings", []))
+		for name:String in result.get("stats", {}):
+			stats[name] = stats.get(name, 0) + result.stats[name]
+	return {"lines": lines, "errors": [], "warnings": diagnostics, "stats": stats}
