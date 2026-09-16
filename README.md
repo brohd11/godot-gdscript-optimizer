@@ -3,6 +3,8 @@
 Shared source transforms for Godot build tools. The first pass lowers `#! struct`
 data classes to arrays, including constructors, type annotations, and field access.
 It uses GDScriptParser and the shared dependency scanner through `utils_remote.gd`.
+Tag discovery and indexing use `addons/addon_lib/tag_parser`; the old
+`tag_registry.gd` remains a compatibility entry point.
 
 ```gdscript
 const Optimizer = preload("res://addons/addon_lib/gdscript_optimizer/optimizer.gd")
@@ -36,4 +38,3 @@ consumers must preserve planned locations until replay, or treat conflicts as er
 No writes, export lifecycle methods, or editor reporting belong in a pass.
 
 Tests: `godot --headless --path . --script res://tests/gdscript_optimizer/run_headless.gd`.
-

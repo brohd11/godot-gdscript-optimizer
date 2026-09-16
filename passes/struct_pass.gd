@@ -2,7 +2,7 @@ extends RefCounted
 ## Plans against original sources, then replays edits on a consumer's output text.
 ## Path relocation and surviving global names belong to the processing context.
 
-const TagRegistry = preload("res://addons/addon_lib/gdscript_optimizer/tag_registry.gd")
+const TagRegistry = preload("res://addons/addon_lib/tag_parser/registry.gd")
 const StructRewrite = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
 const StructTypes = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_types.gd")
 
@@ -31,7 +31,9 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 		for entry:Dictionary in registry.get_file_entries(source):
 			if entry.tag != "struct":
 				continue
-			if entry.attach == TagRegistry.ATTACH_LINE or entry.identity.contains(TagRegistry.MEMBER_DELIM):
+			var valid_attachment:bool = entry.attach == TagRegistry.ATTACH_FILE or \
+				(entry.attach == TagRegistry.ATTACH_MEMBER and entry.target_kind == "class")
+			if not valid_attachment:
 				errors.append("%s:%d: put #! struct on its own line above a class" % [source, entry.line + 1])
 				continue
 			var lines = FileAccess.get_file_as_string(source).split("\n")

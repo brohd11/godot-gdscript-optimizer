@@ -3,7 +3,7 @@ extends RefCounted
 ## the sites naming it. Import-light so a headless suite can load it - struct_pass.gd resolves
 ## names against the export and applies the results.
 
-const TagRegistry = preload("res://addons/addon_lib/gdscript_optimizer/tag_registry.gd")
+const TagRegistry = preload("res://addons/addon_lib/tag_parser/registry.gd")
 
 const CREATE_FUNC = "create"
 const ALLOWED_EXTENDS = ["", "RefCounted", "Object"]
