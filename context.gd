@@ -4,6 +4,8 @@ extends RefCounted
 
 const UtilsRemote = preload("res://addons/addon_lib/gdscript_optimizer/utils_remote.gd")
 
+enum StructReadTypes { OFF, TYPED_LOCALS, AS_CASTS }
+
 var parser_script:GDScript = UtilsRemote.GDScriptParser
 var class_list:Dictionary = {}
 var class_path_lookup:Dictionary = {}
@@ -12,6 +14,8 @@ var map_path:Callable
 var scan_references:Callable
 var injection_header:String = "### GDScript Optimizer Structs"
 var source_snapshots:Dictionary = {}
+var scalar_replacement:bool = false
+var struct_read_types:StructReadTypes = StructReadTypes.OFF
 
 var _scanner
 var _references:Dictionary = {}

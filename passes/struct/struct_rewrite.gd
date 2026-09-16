@@ -257,12 +257,26 @@ static func apply_ops(lines:Array, ops:Dictionary) -> Array:
 	var errors = []
 	for i:int in ops:
 		for op in ops[i]:
-			var idx = lines[i].find(op[0]) if i < lines.size() else -1
+			var idx = code_match(lines[i], op[0]) if i < lines.size() else -1
 			if idx == -1:
 				errors.append(_err(i, "expected `%s` on this line" % op[0]))
 				continue
 			lines[i] = lines[i].substr(0, idx) + op[1] + lines[i].substr(idx + op[0].length())
 	return errors
+
+
+## Text replay must not consume an identical spelling inside a string or a longer identifier.
+static func code_match(code:String, text:String, offset:int = 0) -> int:
+	var mask := _string_mask(code)
+	var at := code.find(text, offset)
+	while at >= 0:
+		var end := at + text.length()
+		var left_ok:bool = at == 0 or not _is_ident_char(text[0]) or (not _is_ident_char(code[at - 1]) and code[at - 1] != ".")
+		var right_ok:bool = end == code.length() or not _is_ident_char(text[-1]) or not _is_ident_char(code[end])
+		if mask[at] == 0 and left_ok and right_ok:
+			return at
+		at = code.find(text, at + 1)
+	return -1
 
 
 ## Innermost first, so a constructor nested in another's args is already an array when the outer
@@ -353,7 +367,7 @@ static func _struct_for(head:String, line:int, resolve:Callable, structs:Diction
 ## read rewritten becomes `var x: T =` with T from `annotate.call(rhs, line, column)` (the type the
 ## source inferred), or plain `=` when that is "".
 static func rewrite_access(lines:PackedStringArray, type_of:Callable, structs:Dictionary, name_for:Callable,
-		annotate:Callable = Callable()) -> Dictionary:
+		annotate:Callable = Callable(), optimization:Variant = null) -> Dictionary:
 	var out:PackedStringArray = lines.duplicate()
 	var ops = {}
 	var used = {}
@@ -381,7 +395,7 @@ static func rewrite_access(lines:PackedStringArray, type_of:Callable, structs:Di
 			var enum_name = _enum_of(structs.get(path, {}), m.get_string("field"))
 			if enum_name == "":
 				continue
-			edits.append([start, dot, m.get_end(), "[%s.%s]" % [name_for.call(path), enum_name]])
+			edits.append([start, dot, m.get_end(), "[%s.%s]" % [name_for.call(path), enum_name], path, m.get_string("field")])
 			used[path] = true
 		if edits.is_empty():
 			continue
@@ -398,6 +412,8 @@ static func rewrite_access(lines:PackedStringArray, type_of:Callable, structs:Di
 			var f = e[2] + _shift(applied, e[2])
 			var from = code.substr(s, f - s)
 			var to = code.substr(s, d - s) + e[3]
+			if optimization != null:
+				to = optimization.replacement(e[4], e[5], lines[i].substr(e[0], e[1] - e[0]), to, i, e[0], e[2])
 			code = code.substr(0, s) + to + code.substr(f)
 			applied.append([e[1], to.length() - from.length()])
 			line_ops.append([from, to])

@@ -39,6 +39,37 @@ definitions and cross-file type resolution see the same post-struct snapshots.
 Consumers must preserve planned locations until replay, or treat conflicts as errors.
 No writes, export lifecycle methods, or editor reporting belong in a pass.
 
+## Optional struct optimizations
+
+```gdscript
+context.scalar_replacement = true
+context.struct_read_types = Optimizer.Context.StructReadTypes.TYPED_LOCALS
+# Alternatives: OFF (default), AS_CASTS.
+```
+
+These settings extend `StructPass`; neither changes default output. Scalar replacement
+plans against original bindings before lowering and inlining. It eliminates direct local
+struct constructors only when all uses are field accesses and every field has a proven
+built-in value type (explicit or `:=`). It supports branches, loops, field assignments,
+compound updates, and value-component writes. Constructor arguments evaluate once in order
+before parameter conversions. Field initialization and conversion remain typed.
+
+Reference/dynamic fields, aliases, reassignment, whole-value uses, captures, coroutines,
+multiline constructors, and unresolved/effectful defaults stay in the existing Array form.
+Supported defaults are literals and built-in value constructors with immutable inputs.
+Scalarization after inline expansion is deferred.
+
+For remaining field reads, `TYPED_LOCALS` inserts typed captures only at supported statement
+sites with safe evaluation order. It skips conditional/multiline evaluation, mixed calls,
+complex receivers, and writes. `AS_CASTS` wraps reads in `(receiver[S.FIELD] as T)` without
+moving them; it skips writes, multiline statements, and inline lambdas/semicolon statements.
+Both use the same built-in value types as the inliner. No repeated-read caching is performed.
+
+Stats are `scalar_structs`, `scalar_accesses`, `scalar_skipped`, `struct_typed_captures`,
+`struct_read_casts`, and `struct_reads_skipped`. They count source sites, not runtime work.
+Skipped scalar candidates and unsafe capture sites produce diagnostic reasons. Consumers
+must benchmark their workloads: typed casts/captures can cost more than they save.
+
 ## Static function inlining
 
 ```gdscript

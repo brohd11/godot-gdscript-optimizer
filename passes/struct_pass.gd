@@ -5,6 +5,7 @@ extends RefCounted
 const TagRegistry = preload("res://addons/addon_lib/tag_parser/registry.gd")
 const StructRewrite = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
 const StructTypes = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_types.gd")
+const StructOptimize = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_optimize.gd")
 
 var plans:Dictionary = {}
 var structs:Dictionary = {}
@@ -78,6 +79,7 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 	var ops = {}
 	var injected = {}
 	var sites = lines
+	var optimization
 	if reachable:
 		StructRewrite.rewrite_lines(lines, resolve, structs) # only fills `names`
 		var types = StructTypes.new(_context.parser_script, source, structs, _parser_cache)
@@ -93,7 +95,9 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 			if not names.has(path):
 				names[path] = _injection(path, lines, injected)
 			return names[path]
-		var access = StructRewrite.rewrite_access(lines, types.type_of, structs, name_for, types.annotation)
+		if _context.scalar_replacement or _context.struct_read_types != 0:
+			optimization = StructOptimize.new(lines, types, _context)
+		var access = StructRewrite.rewrite_access(lines, types.type_of, structs, name_for, types.annotation, optimization)
 		ops = access.ops
 		sites = access.lines
 
@@ -102,6 +106,10 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 		errors.append("%s %s" % [source, err])
 	for line in result.ops:
 		ops.get_or_add(line, []).append_array(result.ops[line])
+	if optimization != null:
+		optimization.finish(result.lines, ops)
+		for warning:String in optimization.warnings:
+			_warnings.append("%s: %s" % [source, warning])
 
 	var bodies = []
 	for def:Dictionary in structs.values():
@@ -118,7 +126,8 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 
 	if ops.is_empty() and bodies.is_empty() and injected.is_empty():
 		return {}
-	return {"ops": ops, "bodies": bodies, "injected": injected}
+	return {"ops": ops, "bodies": bodies, "injected": injected,
+		"stats": optimization.stats if optimization != null else {}}
 
 
 ## Files whose references reach a struct script. Only these can hold a value the parser types as a
@@ -229,4 +238,4 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 			if inj.tail != "":
 				line += "." + inj.tail
 			lines.append(line)
-	return {"lines": lines, "errors": []}
+	return {"lines": Array("\n".join(lines).split("\n")), "errors": [], "stats": plan.get("stats", {})}
