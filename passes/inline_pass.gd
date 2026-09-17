@@ -111,10 +111,11 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 		if argument.assignment != "":
 			defaults[name] = _default(parser, argument.assignment, function.declaration_line)
 	var rest:String = function.rest_argument
-	var return_type := Body.TypeInfo.normalize(function.get_return_type_raw(), parser, function.declaration_line)
+	var raw_return:String = function.get_return_type_raw().strip_edges()
+	var return_type := "void" if raw_return == "void" else Body.TypeInfo.normalize(raw_return, parser, function.declaration_line)
 	if return_type == "":
 		return_type = "Variant"
-	if not Body.TypeInfo.supported(return_type, parser) and not _direct_type(return_type):
+	if return_type != "void" and not Body.TypeInfo.supported(return_type, parser) and not _direct_type(return_type):
 		return {"error": "a supported explicit return type is required"}
 	var statements:Array = []
 	var state := {"quote": "", "depth": 0, "cont": false}
@@ -152,7 +153,7 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 			direct = {"expression": logical}
 	var reduction := _reduction(statements, rest, return_type)
 	var assessed := Body.assess(parser, normalized, params, return_type)
-	var template_eligible:bool = not assessed.has("error") and Body.TypeInfo.supported(return_type, parser)
+	var template_eligible:bool = not assessed.has("error") and (return_type == "void" or Body.TypeInfo.supported(return_type, parser))
 	for type:String in params.values():
 		template_eligible = template_eligible and Body.TypeInfo.supported(type, parser)
 	if not template_eligible:
@@ -253,7 +254,7 @@ func _default(parser, expression:String, line:int) -> Dictionary:
 
 func apply(key:String, input_lines:Array) -> Dictionary:
 	var result := {"lines": input_lines, "errors": [], "warnings": [],
-		"stats": {"inline_calls": 0, "inline_skipped": 0, "inline_direct_calls": 0, "inline_expanded_calls": 0, "inline_substituted_args": 0, "inline_captured_args": 0, "inline_repeated_access_captures": 0}}
+		"stats": {"inline_calls": 0, "inline_skipped": 0, "inline_direct_calls": 0, "inline_expanded_calls": 0, "inline_early_return_calls": 0, "inline_substituted_args": 0, "inline_captured_args": 0, "inline_repeated_access_captures": 0}}
 	if not plans.has(key):
 		return result
 	var path:String = plans[key]
@@ -559,10 +560,14 @@ func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 	var target := RegEx.new()
 	target.compile(r"^(?:var\s+[A-Za-z_][A-Za-z_0-9]*(?:\s*:\s*[A-Za-z_][A-Za-z_0-9.\[\], ]*)?\s*:?=|([A-Za-z_][A-Za-z_0-9]*)\s*=|return)$")
 	var match_target := target.search(statement)
-	if match_target == null:
-		return {}
-	if match_target.get_string(1) != "" and not call.locals.has(match_target.get_string(1)):
-		return {}
+	if call.definition.return_type == "void":
+		if not statement.is_empty():
+			return {}
+	else:
+		if match_target == null:
+			return {}
+		if match_target.get_string(1) != "" and not call.locals.has(match_target.get_string(1)):
+			return {}
 	var unique := "_inline_%d_" % site.start
 	while source.contains(unique):
 		unique += "_"
@@ -592,6 +597,8 @@ func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 
 func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, prefix:String, suffix:String, start:int, end:int) -> Dictionary:
 	var definition:Dictionary = call.definition
+	var is_void:bool = definition.return_type == "void"
+	var early_returns:bool = definition.early_returns
 	var aliases := {"prefix": unique}
 	var bindings:Dictionary = {}
 	var captures:Array = []
@@ -685,6 +692,9 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 	var bridge := unique + "bridge"
 	while bindings.values().has(bridge) or bridge == result_name:
 		bridge += "_"
+	var loop_name := unique + "once"
+	while bindings.values().has(loop_name) or loop_name in [result_name, bridge]:
+		loop_name += "_"
 	var return_type := Body.TypeInfo.emit(definition.return_type, parser, aliases)
 	var indent := prefix.substr(0, prefix.length() - prefix.strip_edges(true, false).length())
 	var unit := "\t"
@@ -713,23 +723,38 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 		text = unit.repeat(body.indent / definition.indent_width) + text.strip_edges(true, false)
 		if body["return"]:
 			var relative := text.substr(0, text.length() - text.strip_edges(true, false).length())
-			text = relative + result_name + " = " + text.strip_edges().trim_prefix("return ")
+			if is_void:
+				text = relative + "break"
+			else:
+				text = relative + result_name + " = " + text.strip_edges().trim_prefix("return ")
 		rendered.append(text)
 	for path:String in aliases:
 		if path != "prefix":
 			lines.append(indent + 'const %s = preload("%s")' % [aliases[path], path])
-	lines.append(indent + "var " + bridge + ":Variant")
+	if not is_void:
+		lines.append(indent + "var " + bridge + ":Variant")
 	lines.append(indent + "if true:")
 	for capture:String in captures:
 		lines.append(indent + unit + capture)
-	lines.append(indent + unit + "var %s:%s" % [result_name, return_type])
+	if not is_void:
+		lines.append(indent + unit + "var %s:%s" % [result_name, return_type])
+	var body_indent := indent + unit
+	if early_returns:
+		lines.append(indent + unit + "for %s in 1:" % loop_name)
+		body_indent += unit
+		stats.inline_early_return_calls = 1
 	for text:String in rendered:
-		lines.append(indent + unit + text)
-	lines.append(indent + unit + "%s = %s" % [bridge, result_name])
-	# The typed cast retains := inference; the bridge is cleared after the caller consumes it.
-	lines.append(prefix + "(" + bridge + " as " + return_type + ")" + suffix)
-	if prefix.strip_edges() != "return":
-		lines.append(indent + bridge + " = null")
+		for line:String in text.split("\n"):
+			lines.append(body_indent + line)
+	if is_void:
+		if not suffix.strip_edges().is_empty():
+			lines[0] += " " + suffix.strip_edges()
+	else:
+		lines.append(indent + unit + "%s = %s" % [bridge, result_name])
+		# The typed cast retains := inference; the bridge is cleared after the caller consumes it.
+		lines.append(prefix + "(" + bridge + " as " + return_type + ")" + suffix)
+		if prefix.strip_edges() != "return":
+			lines.append(indent + bridge + " = null")
 	var events:Array = []
 	for event:Dictionary in definition.nested:
 		var child := event.duplicate()
@@ -738,7 +763,10 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 			site.reason = "inline depth limit"
 			return {}
 		events.append(child)
-	events.append(_event(definition, 0, "expanded"))
+	var event := _event(definition, 0, "expanded")
+	if early_returns:
+		event.control_flow = "single_iteration"
+	events.append(event)
 	return {"start": start, "end": end, "text": "\n".join(lines), "mode": "expanded", "stats": stats, "events": events}
 
 

@@ -45,7 +45,7 @@ func output_path(key:String) -> String:
 
 
 func resolve_name(script:GDScript, name:String) -> Variant:
-	return parser_script.UClassDetail.resolve_script_access_path(script, name)
+	return parser_script.URClassDetail.resolve_script_access_path(script, name)
 
 
 func references(path:String) -> Array:

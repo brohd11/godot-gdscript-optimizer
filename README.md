@@ -132,8 +132,9 @@ Projection, Color, and RID. Node/raw Object and packed-array extensions are defe
 
 Preflight records parameter token slots, reference counts, rebinding, field/index
 writes, and calls. Bodies may declare typed/inferred locals, assign locals/parameters
-or their fields, and finish with a return or an exhaustive terminal if/elif/else tree.
-Nested terminal branches are supported; every statement must occupy one line.
+or their fields, and use nested if/elif/else branches. Value-returning helpers must
+finish with a return or an exhaustive terminal return tree. Explicit `-> void` helpers allow early bare returns,
+`pass`, and normal fallthrough. Every statement must occupy one line.
 Immutable constants and script/type aliases retain their defining scope.
 
 Replay chooses bindings separately for each parameter:
@@ -153,24 +154,39 @@ A typed result crosses that block through a temporary Variant, is cast back to r
 `:=` inference, and the bridge is cleared after assignment. Imported locals therefore
 do not extend reference lifetimes to the end of the caller.
 
+Only void bodies use a generated `for <unique_name> in 1:` loop; bare returns become
+breaks. These helpers expand at standalone call statements without a result or bridge.
+Value-returning guard-clause helpers remain calls: the benchmark showed little gain
+from the result/bridge wrapper, so that expansion is deliberately unsupported.
+Existing direct expressions and terminal return trees retain their previous lowering.
+With `debug_tags: true`, wrapper sites include `control_flow="single_iteration"`.
+
 Omitted defaults support literals/null, value constructors with constant inputs, and
 resolvable immutable value constants. Mutable collection or executable defaults leave
 the omitted-argument call unchanged; explicitly supplying that argument remains eligible.
 
 Calls use a script constant/global class, or a direct call inside another static
 function in the same script. Original definitions remain intact. Template Variant declarations,
-loops, arbitrary early returns, lambdas/await in imported bodies, mutable external
+loops, match, lambdas/await in imported bodies, mutable external
 bindings, remain unsupported in templates. Ambiguous/unsupported sites stay
 unchanged with diagnostics. No statement expansion is hoisted from a larger expression.
-A single-iteration loop plus result/break for general early returns is a follow-up
-experiment; its control-flow cost needs a separate benchmark.
+Loops inside imported bodies remain unsupported because a rewritten break would
+otherwise exit the inner loop. Calls inside a caller's loop are supported.
 
 Replay stats expose `inline_calls`, `inline_skipped`, `inline_direct_calls`,
-`inline_expanded_calls`, `inline_substituted_args`, `inline_captured_args`, and
+`inline_expanded_calls`, `inline_early_return_calls` (a subset of expanded calls),
+`inline_substituted_args`, `inline_captured_args`, and
 `inline_repeated_access_captures`. Counts describe source sites, not runtime invocations.
 Tagging is opt-in: removal of call overhead does not guarantee a speedup for every body.
 
 Tests: `godot --headless --path . --script res://tests/gdscript_optimizer/run_headless.gd`.
+
+Early-return benchmark:
+`godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_early_return.gd -- 200000 7`.
+It compares original calls with optimizer output for first/second guards, fallthrough,
+and mixed inputs. Void effects are inlined; typed-result helpers remain as a control
+(the report includes `inlined`). Checksums verify behavior;
+median timings exclude optimization, compilation, and warmup.
 
 Predicate benchmark (original versus transformed code, median microseconds and checksum):
 `godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_expression.gd -- 200000 7`.

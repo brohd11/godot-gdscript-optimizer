@@ -18,8 +18,13 @@ static func assess(parser, statements:Array, params:Dictionary, return_type:Stri
 	for name:String in params:
 		metadata.uses[name] = {"count": 0, "positions": [], "rebound": false, "written": false, "member": false}
 	var grammar := _block(statements, 0, 0)
-	if not grammar.ok or grammar.end != statements.size():
-		return {"error": "body must end in a return or an exhaustive terminal if/elif/else tree"}
+	var terminal:bool = grammar.ok and grammar.end == statements.size()
+	var flow := _flow(statements, 0, 0, return_type == "void")
+	if not flow.ok or flow.end != statements.size() or (return_type != "void" and flow.falls):
+		return {"error": "body must use supported conditionals and return a value on every path (or declare void)"}
+	if not terminal and return_type != "void":
+		return {"error": "single-iteration early-return expansion is limited to void helpers"}
+	metadata.early_returns = return_type == "void"
 	var body:Array = []
 	for statement:Dictionary in statements:
 		var code:String = statement.code
@@ -28,12 +33,12 @@ static func assess(parser, statements:Array, params:Dictionary, return_type:Stri
 		var expression := ""
 		var declared := ""
 		var declaration_type := ""
-		var returned := code.begins_with("return ")
+		var returned := code == "return" or code.begins_with("return ")
 		if returned:
-			expression = code.trim_prefix("return ")
+			expression = "" if code == "return" else code.trim_prefix("return ")
 		elif code.begins_with("if ") or code.begins_with("elif "):
 			expression = code.substr(code.find(" ") + 1).trim_suffix(":")
-		elif code == "else:":
+		elif code in ["else:", "pass"]:
 			pass
 		elif code.begins_with("var ") or code.begins_with("const "):
 			var data:Variant = parser.Utils.get_var_or_const_info(code)
@@ -74,6 +79,43 @@ static func assess(parser, statements:Array, params:Dictionary, return_type:Stri
 	metadata.body = body
 	metadata.return_type = return_type
 	return metadata
+
+
+static func _flow(lines:Array, start:int, indent:int, is_void:bool) -> Dictionary:
+	var i := start
+	var falls := true
+	while i < lines.size() and lines[i].indent >= indent:
+		if not falls or lines[i].indent != indent:
+			return {"ok": false, "end": i, "falls": falls}
+		var code:String = lines[i].code
+		if code == "return" or code.begins_with("return "):
+			if (code == "return") != is_void:
+				return {"ok": false, "end": i, "falls": falls}
+			falls = false
+			i += 1
+		elif code.begins_with("if ") and code.ends_with(":"):
+			var has_else := false
+			var branch_falls := false
+			var first := true
+			while i < lines.size() and lines[i].indent == indent:
+				code = lines[i].code
+				if not (first or code.begins_with("elif ") or code == "else:"):
+					break
+				if has_else or not code.ends_with(":") or i + 1 >= lines.size() or lines[i + 1].indent <= indent:
+					return {"ok": false, "end": i, "falls": falls}
+				first = false
+				has_else = code == "else:"
+				var child := _flow(lines, i + 1, lines[i + 1].indent, is_void)
+				if not child.ok:
+					return child
+				branch_falls = branch_falls or child.falls
+				i = child.end
+			falls = not has_else or branch_falls
+		else:
+			if code.ends_with(":") or code.begins_with("return") or code.begins_with("elif ") or code in ["break", "continue"]:
+				return {"ok": false, "end": i, "falls": falls}
+			i += 1
+	return {"ok": true, "end": i, "falls": falls}
 
 
 static func _block(lines:Array, start:int, indent:int) -> Dictionary:

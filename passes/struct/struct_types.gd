@@ -15,7 +15,7 @@ func _init(parser_script:GDScript, source:String, p_structs:Dictionary, cache:Di
 	structs = p_structs
 	_ins = parser_script.Keys.INS_DELIM
 	_type_delim = parser_script.Keys.TYPE_DELIM
-	var ucd = parser_script.UClassDetail
+	var ucd = parser_script.URClassDetail
 	if ucd.global_class_registry.is_empty(): # filled by an editor signal, absent headless
 		ucd.global_class_registry = ucd.get_all_global_class_paths()
 
