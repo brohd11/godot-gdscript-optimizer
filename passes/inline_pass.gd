@@ -1,6 +1,7 @@
 extends RefCounted
 ## Definitions are catalogued once; calls are resolved on replay after preceding passes finish.
 
+const DebugTags = preload("res://addons/addon_lib/gdscript_optimizer/debug_tags.gd")
 const Registry = preload("res://addons/addon_lib/tag_parser/registry.gd")
 const Body = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/body.gd")
 const DirectExpression = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/expression.gd")
@@ -12,6 +13,11 @@ var _tagged:Dictionary = {}
 var _names:Dictionary = {}
 var _snapshots:Dictionary = {}
 var _context
+var _catalog:Dictionary = {}
+var _building:Array = []
+var _definition_errors:Dictionary = {}
+const MAX_DEPTH = 16
+const MAX_TOKENS = 4096
 
 
 func prepare(sources:Dictionary, context) -> Dictionary:
@@ -19,6 +25,9 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 	_definitions.clear()
 	_tagged.clear()
 	_names.clear()
+	_catalog.clear()
+	_building.clear()
+	_definition_errors.clear()
 	_context = context
 	_snapshots = context.source_snapshots.duplicate()
 	var errors:Array = []
@@ -34,19 +43,15 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 		var tags:Array = Registry.scan_lines(lines, path).filter(func(entry): return entry.tag == "inline")
 		if tags.is_empty():
 			continue
-		var parser = _parser(path, "\n".join(lines))
-		if parser == null:
-			errors.append("%s: could not parse inline definitions" % path)
-			continue
 		for tag:Dictionary in tags:
 			_tagged[tag.identity] = true
-			var definition := _definition(tag, lines, parser)
-			if definition.has("error"):
-				warnings.append("%s:%d: #! inline skipped: %s" % [path, tag.line + 1, definition.error])
-			else:
-				_definitions[tag.identity] = definition
-				_names[tag.target_name] = true
-		_dispose(parser)
+			_catalog[tag.identity] = tag
+			_names[tag.target_name] = true
+	for identity:String in _catalog:
+		_build_definition(identity)
+	for identity:String in _definition_errors:
+		var tag:Dictionary = _catalog[identity]
+		warnings.append("%s:%d: #! inline skipped: %s" % [tag.file, tag.line + 1, _definition_errors[identity]])
 	if not _definitions.is_empty():
 		for key:String in sources:
 			if sources[key].get_extension() == "gd":
@@ -54,9 +59,42 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 	return {"errors": errors, "warnings": warnings}
 
 
+func _build_definition(identity:String) -> Dictionary:
+	if _definitions.has(identity):
+		return _definitions[identity]
+	if _definition_errors.has(identity):
+		if not _definition_errors[identity].contains("depth limit"):
+			return {}
+		_definition_errors.erase(identity)
+	if identity in _building or _building.size() >= MAX_DEPTH:
+		_definition_errors[identity] = "recursive inline cycle" if identity in _building else "inline depth limit"
+		return {}
+	var tag:Dictionary = _catalog[identity]
+	var source:String = _snapshots.get(tag.file, FileAccess.get_file_as_string(tag.file))
+	var parser = _parser(tag.file, source)
+	if parser == null:
+		_definition_errors[identity] = "could not parse inline definition"
+		return {}
+	_building.append(identity)
+	var definition := _definition(tag, source.split("\n"), parser)
+	_building.pop_back()
+	_dispose(parser)
+	if definition.has("error") or _definition_errors.has(identity):
+		_definition_errors[identity] = definition.get("error", _definition_errors.get(identity, "unsupported definition"))
+		return {}
+	_definitions[identity] = definition
+	return definition
+
+
 func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 	if tag.attach != Registry.ATTACH_MEMBER or tag.target_kind != "func" or tag.owner_class != tag.file:
 		return {"error": "tag a top-level static function declaration"}
+	var options:Dictionary = Registry.Options.parse(tag.args)
+	if not tag.mods.is_empty() or not options.errors.is_empty():
+		return {"error": "invalid inline options: " + str(options.errors)}
+	for option:String in options.options:
+		if option != "substitute" or options.options[option] != true:
+			return {"error": "unknown inline option or unexpected value: " + option}
 	var function = parser.get_class_object().functions.get(tag.target_name)
 	if function == null or not function.is_static():
 		return {"error": "only static functions are supported"}
@@ -72,6 +110,7 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 		params[name] = type
 		if argument.assignment != "":
 			defaults[name] = _default(parser, argument.assignment, function.declaration_line)
+	var rest:String = function.rest_argument
 	var return_type := Body.TypeInfo.normalize(function.get_return_type_raw(), parser, function.declaration_line)
 	if return_type == "":
 		return_type = "Variant"
@@ -91,21 +130,56 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 			statements.append({"code": code, "text": line.substr(base_indent), "line": index, "indent": indent - base_indent})
 	var direct:Dictionary = {}
 	var logical := _single_return(statements, parser, lines)
+	var nested:Array = []
+	var normalized:Array = []
+	for statement:Dictionary in statements:
+		var rewritten := _compose_expression(statement.code, parser, tag.file, statement.line, 0, true)
+		if rewritten.get("fatal", false):
+			return {"error": rewritten.reason}
+		var copy := statement.duplicate()
+		copy.code = rewritten.text
+		copy.text = statement.text.substr(0, statement.text.length() - statement.text.strip_edges(true, false).length()) + rewritten.text
+		normalized.append(copy)
+		nested.append_array(rewritten.events)
 	if logical != "":
+		var rewritten := _compose_expression(logical, parser, tag.file, statements[0].line, 0, true)
+		if rewritten.get("fatal", false):
+			return {"error": rewritten.reason}
+		logical = rewritten.text
+		nested = rewritten.events
 		var analyzed := _expression(logical, params, parser, statements[0].line)
 		if analyzed.error == "" and _direct_return(analyzed.type, return_type):
 			direct = {"expression": logical}
-	var assessed := Body.assess(parser, statements, params, return_type)
+	var reduction := _reduction(statements, rest, return_type)
+	var assessed := Body.assess(parser, normalized, params, return_type)
 	var template_eligible:bool = not assessed.has("error") and Body.TypeInfo.supported(return_type, parser)
 	for type:String in params.values():
 		template_eligible = template_eligible and Body.TypeInfo.supported(type, parser)
 	if not template_eligible:
-		if direct.is_empty():
+		if direct.is_empty() and reduction == "":
 			return assessed if assessed.has("error") else {"error": "unsupported template signature or direct expression"}
 		assessed = {}
-	assessed.merge({"file": tag.file, "params": params, "defaults": defaults, "return_type": return_type,
-		"direct": direct, "template_eligible": template_eligible, "indent_width": base_indent})
+	assessed.merge({"identity": tag.identity, "file": tag.file, "params": params, "defaults": defaults, "rest": rest,
+		"return_type": return_type, "direct": direct, "template_eligible": template_eligible,
+		"substitute": options.options.has("substitute"), "reduction": reduction, "nested": nested,
+		"indent_width": base_indent})
 	return assessed
+
+
+func _reduction(statements:Array, rest:String, return_type:String) -> String:
+	if rest == "" or return_type != "bool" or statements.size() != 4:
+		return ""
+	var loop := RegEx.create_from_string(r"^for\s+(\w+)(?:\s*:\s*(?:bool|Variant))?\s+in\s+(\w+):$").search(statements[0].code)
+	if loop == null or loop.get_string(2) != rest:
+		return ""
+	if statements[0].indent != 0 or statements[3].indent != 0 or statements[1].indent <= 0 or statements[2].indent <= statements[1].indent:
+		return ""
+	var name := loop.get_string(1)
+	if statements[1].code == "if not " + name + ":" and statements[2].code == "return false" and statements[3].code == "return true":
+		return "and"
+	if statements[1].code == "if " + name + ":" and statements[2].code == "return true" and statements[3].code == "return false":
+		return "or"
+	return ""
 
 
 func _direct_type(type:String) -> bool:
@@ -184,26 +258,7 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 		return result
 	var path:String = plans[key]
 	var source := "\n".join(input_lines)
-	var lexer = _context.parser_script.CodeEditParser.LambdaScanner
-	var tokens:Array = lexer._tokens(source)
-	var candidates:Array = []
-	for i in range(1, tokens.size() - 1):
-		var token:Dictionary = tokens[i]
-		if not _names.has(token.text) or tokens[i + 1].text != "(" or tokens[i - 1].text == "func":
-			continue
-		if source.substr(token.offset, token.end - token.offset) != token.text:
-			continue
-		var start := i
-		if i >= 2 and tokens[i - 1].text == "." and tokens[i - 2].text.is_valid_ascii_identifier():
-			start = i - 2
-		if start > 0 and tokens[start - 1].text in [".", ")", "]"]:
-			continue
-		var end:int = lexer._matching(tokens, i + 1)
-		if end >= 0:
-			candidates.append({"start": tokens[start].offset, "end": tokens[end].end,
-				"line": tokens[start].line, "column": tokens[start].column,
-				"callee": source.substr(tokens[start].offset, token.end - tokens[start].offset),
-				"args": source.substr(tokens[i + 1].end, tokens[end].offset - tokens[i + 1].end)})
+	var candidates := _candidates(source)
 	if candidates.is_empty():
 		return result
 	var parser = _parser(path, source)
@@ -212,41 +267,58 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 		return result
 	var edits:Array = []
 	for site:Dictionary in candidates:
-		var replacement:Dictionary = {}
-		var nested:bool = candidates.any(func(other): return (other != site and
-			((other.start < site.start and other.end > site.end) or (site.start < other.start and site.end > other.end))))
-		if not nested:
-			replacement = _expand(site, parser, path, source)
+		if edits.any(func(edit): return edit.start <= site.start and edit.end >= site.end):
+			continue
+		var replacement := _expand(site, parser, path, source)
 		if replacement.is_empty():
 			result.stats.inline_skipped += 1
 			result.warnings.append("%s:%d: inline candidate %s left unchanged (%s)" % [path, site.line + 1, site.callee, site.get("reason", "unsupported or unresolved call")])
 		else:
+			replacement.origin = "%s:%d" % [path, site.line + 1]
 			edits.append(replacement)
 			result.stats["inline_" + replacement.mode + "_calls"] += 1
-			result.stats.inline_calls += 1
+			result.stats.inline_calls += replacement.events.size()
+			result.stats.inline_direct_calls += replacement.events.size() - 1
 			for name:String in replacement.get("stats", {}):
 				result.stats[name] += replacement.stats[name]
 	_dispose(parser)
-	edits.reverse()
+	edits.sort_custom(func(a, b): return a.start > b.start)
+	var markers:Array = []
 	for edit:Dictionary in edits:
+		for marker:Dictionary in markers:
+			if marker.offset >= edit.end:
+				marker.offset += edit.text.length() - (edit.end - edit.start)
+		if _context.debug_tags:
+			for event:Dictionary in edit.events:
+				var details := event.duplicate()
+				details.site = edit.origin
+				markers.append({"offset": edit.start, "kind": "inline", "details": details})
 		source = source.substr(0, edit.start) + edit.text + source.substr(edit.end)
 	result.lines = Array(source.split("\n"))
+	if _context.debug_tags:
+		for marker:Dictionary in markers:
+			marker.line = source.substr(0, marker.offset).count("\n")
+		result.lines = DebugTags.annotate(result.lines, markers)
 	return result
 
 
-func _resolve_call(site:Dictionary, parser, path:String) -> Dictionary:
+func _resolve_call(site:Dictionary, parser, path:String, inside:bool = false) -> Dictionary:
 	var class_obj = parser.get_class_object(parser.get_class_at_line(site.line))
 	var function = class_obj.functions.get(parser.get_function_at_line(site.line))
 	if function == null or class_obj.get_lambda_at_line(site.line, site.column) != null:
 		return {}
-	if _tagged.has(class_obj.get_script_class_path() + Registry.MEMBER_DELIM + function.name):
+	if not inside and _tagged.has(class_obj.get_script_class_path() + Registry.MEMBER_DELIM + function.name):
 		return {}
 	var callee:String = site.callee.replace(" ", "").replace("\t", "")
 	var rich:Dictionary = parser.resolve_expression_to_type_rich(callee, site.line, site.column)
 	var identity:String = rich.get("origin", "").trim_suffix(_context.parser_script.Keys.CALLABLE_SUFFIX)
-	if not _definitions.has(identity):
+	if not _catalog.has(identity):
 		return {}
-	var definition:Dictionary = _definitions[identity]
+	var definition := _build_definition(identity)
+	if definition.is_empty():
+		site.reason = _definition_errors.get(identity, "unsupported nested inline")
+		site.fatal = site.reason.contains("cycle") or site.reason.contains("limit")
+		return {}
 	var locals:Dictionary = function.get_in_scope_local_vars(site.line, site.column)
 	if callee.contains("."):
 		var alias := callee.get_slice(".", 0)
@@ -262,66 +334,215 @@ func _resolve_call(site:Dictionary, parser, path:String) -> Dictionary:
 			return {}
 	elif locals.has(callee) or not function.is_static() or path != definition.file:
 		return {}
-	var args:Array = _context.parser_script.Utils.GDScriptParse.safe_split_args(site.args)
+	var supplied:Array = _context.parser_script.Utils.GDScriptParse.safe_split_args(site.args)
 	if site.args.strip_edges().is_empty():
-		args = []
-	if args.size() > definition.params.size():
+		supplied = []
+	var fixed:int = definition.params.size() - int(definition.rest != "")
+	if supplied.size() > fixed and definition.rest == "":
 		return {}
-	var explicit_count := args.size()
-	for name:String in definition.params.keys().slice(explicit_count):
+	var args:Array = supplied.slice(0, fixed)
+	var default_indices:Array = []
+	for name:String in definition.params.keys().slice(args.size(), fixed):
 		if not definition.defaults.has(name) or not definition.defaults[name].supported:
 			site.reason = "missing required argument or unsupported omitted default: " + name
 			return {}
+		default_indices.append(args.size())
 		args.append(definition.defaults[name].expression)
-	return {"definition": definition, "function": function, "locals": locals, "args": args, "explicit_count": explicit_count}
+	var rest_args:Array = supplied.slice(fixed)
+	if definition.rest != "":
+		args.append("[" + ", ".join(rest_args) + "]")
+	return {"definition": definition, "function": function, "locals": locals, "args": args,
+		"explicit_count": supplied.size(), "default_indices": default_indices, "rest_args": rest_args, "supplied": supplied}
 
 
-func _direct(site:Dictionary, parser, call:Dictionary) -> String:
+func _candidates(source:String, base_line:int = 0, base_column:int = 0) -> Array:
+	var lexer = _context.parser_script.CodeEditParser.LambdaScanner
+	var tokens:Array = lexer._tokens(source)
+	var out:Array = []
+	for i in range(tokens.size() - 1):
+		var token:Dictionary = tokens[i]
+		if not _names.has(token.text) or tokens[i + 1].text != "(" or (i > 0 and tokens[i - 1].text == "func"):
+			continue
+		if source.substr(token.offset, token.end - token.offset) != token.text:
+			continue
+		var start := i
+		if i >= 2 and tokens[i - 1].text == "." and tokens[i - 2].text.is_valid_ascii_identifier():
+			start = i - 2
+		if start > 0 and tokens[start - 1].text in [".", ")", "]"]:
+			continue
+		var end:int = lexer._matching(tokens, i + 1)
+		if end >= 0:
+			out.append({"start": tokens[start].offset, "end": tokens[end].end,
+				"line": base_line + tokens[start].line,
+				"column": tokens[start].column + (base_column if tokens[start].line == 0 else 0),
+				"callee": source.substr(tokens[start].offset, token.end - tokens[start].offset),
+				"args_start": tokens[i + 1].end,
+				"args": source.substr(tokens[i + 1].end, tokens[end].offset - tokens[i + 1].end)})
+	return out
+
+
+func _compose_expression(source:String, parser, path:String, line:int, column:int, inside:bool, depth:int = 0) -> Dictionary:
+	var result := {"text": source, "events": [], "fatal": false, "reason": ""}
+	if depth >= MAX_DEPTH:
+		result.merge({"fatal": true, "reason": "inline depth limit"}, true)
+		return result
+	var candidates := _candidates(source, line, column)
+	var edits:Array = []
+	for site:Dictionary in candidates:
+		if candidates.any(func(other): return other.start < site.start and other.end > site.end):
+			continue
+		var call := _resolve_call(site, parser, path, inside)
+		var expanded := _direct_node(site, parser, call, path, inside, depth) if not call.is_empty() else {}
+		if site.get("fatal", false):
+			result.merge({"fatal": true, "reason": site.reason}, true)
+			return result
+		if expanded.is_empty():
+			# A failed parent must not prevent independent expression children from optimizing.
+			var children := _compose_expression(site.args, parser, path, site.line, site.column, inside, depth + 1)
+			if children.fatal:
+				return children
+			if not children.events.is_empty():
+				edits.append({"start": site.args_start, "end": site.end - 1, "text": children.text})
+				result.events.append_array(children.events)
+		else:
+			edits.append({"start": site.start, "end": site.end, "text": expanded.text})
+			result.events.append_array(expanded.events)
+	edits.reverse()
+	for edit:Dictionary in edits:
+		result.text = result.text.substr(0, edit.start) + edit.text + result.text.substr(edit.end)
+	if _context.parser_script.CodeEditParser.LambdaScanner._tokens(result.text).size() > MAX_TOKENS:
+		return {"text": source, "events": [], "fatal": true, "reason": "inline token limit"}
+	return result
+
+
+func _local_types(call:Dictionary, parser, site:Dictionary) -> Dictionary:
+	var types:Dictionary = {}
+	for name:String in call.locals:
+		var data := _local_data(call, name)
+		var type := Body.type_of(parser, name, site.line, site.column) if data.get("has_static_type", false) else "Variant"
+		types[name] = type if type != "" else "Variant"
+	return types
+
+
+func _pure(source:String, types:Dictionary, parser, line:int, column:int) -> bool:
+	if _expression(source, types, parser, line, column).error != "":
+		return false
+	var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(source)
+	for token:Dictionary in tokens:
+		if token.text in ["/", "%", "["] or DirectExpression.reference_type(types.get(token.text, "")) or types.get(token.text, "") == "Variant":
+			return false
+	return true
+
+
+func _argument(source:String, site:Dictionary, parser, call:Dictionary, path:String, inside:bool, depth:int) -> Dictionary:
+	var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(source)
+	if tokens.any(func(token): return token.text in ["await", "func"]):
+		return {}
+	var rewritten := _compose_expression(source, parser, path, site.line, site.column, inside, depth + 1)
+	if rewritten.fatal:
+		site.fatal = true
+		site.reason = rewritten.reason
+		return {}
+	var types := _local_types(call, parser, site)
+	var text:String = rewritten.text.strip_edges()
+	var checked := _expression(text, types, parser, site.line, site.column)
+	var type:String = checked.type if checked.error == "" else Body.type_of(parser, source, site.line, site.column)
+	if types.has(text):
+		type = types[text]
+	if type == "":
+		type = "Variant"
+	var stable:bool = types.has(text) or (checked.error == "" and (text.is_valid_int() or text.is_valid_float() or text in ["true", "false", "null"] or (tokens.size() == 1 and tokens[0].text == "string")))
+	return {"text": text, "type": type, "pure": stable or _pure(text, types, parser, site.line, site.column), "events": rewritten.events}
+
+
+func _event(definition:Dictionary, depth:int, mode:String = "direct") -> Dictionary:
+	return {"callee": definition.identity, "mode": mode, "args": "substitute" if definition.substitute else "",
+		"depth": depth}
+
+
+func _direct_node(site:Dictionary, parser, call:Dictionary, path:String, inside:bool, depth:int = 0) -> Dictionary:
 	var definition:Dictionary = call.definition
-	if definition.direct.is_empty() or call.explicit_count != call.args.size():
-		return ""
+	if depth >= MAX_DEPTH:
+		site.merge({"fatal": true, "reason": "inline depth limit"}, true)
+		return {}
+	if not call.default_indices.is_empty() or (definition.direct.is_empty() and definition.reduction == ""):
+		return {}
 	var bindings:Dictionary = {}
 	var types:Dictionary = {}
-	var names:Array = definition.params.keys()
-	for i in call.args.size():
-		var argument:String = call.args[i].strip_edges()
-		var type := ""
-		if argument.is_valid_ascii_identifier() and argument not in ["true", "false", "null"]:
-			if not call.locals.has(argument):
-				return ""
-			var data := _local_data(call, argument)
-			type = Body.type_of(parser, argument, site.line, site.column) if data.get("has_static_type", false) else "Variant"
-			if type == "":
-				type = "Variant"
-			types[argument] = type
-		else:
-			var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(argument)
-			var literal:bool = argument.is_valid_int() or argument.is_valid_float() or argument in ["true", "false", "null"]
-			literal = literal or (tokens.size() == 1 and tokens[0].text == "string" and argument[0] in ['"', "'"])
-			if not literal:
-				return ""
-			var analyzed := _expression(argument, {}, parser, site.line, site.column)
-			if analyzed.error != "":
-				return ""
-			type = analyzed.type
-		var expected:String = definition.params[names[i]]
-		if not _direct_type(type) or not _direct_type(expected) or not _direct_return(type, expected):
-			return ""
-		bindings[names[i]] = "(" + argument + ")"
-	var expanded:String = "(" + Body.rename(parser, definition.direct.expression, bindings) + ")"
-	var checked := _expression(expanded, types, parser, site.line, site.column)
-	if checked.error != "":
-		site.reason = checked.error
-	return expanded if checked.error == "" and _direct_return(checked.type, definition.return_type) else ""
+	var nodes:Array = []
+	var events:Array = []
+	var args:Array = call.rest_args if definition.reduction != "" else call.args
+	if definition.reduction != "" and definition.params.size() != 1:
+		return {}
+	if definition.reduction == "" and definition.rest != "":
+		return {}
+	var logical:String = definition.direct.get("expression", "")
+	var placeholders:Array = []
+	for i in args.size():
+		var node := _argument(args[i], site, parser, call, path, inside, depth)
+		if node.is_empty() or (not definition.substitute and not node.pure):
+			return {}
+		var expected:String = "bool" if definition.reduction != "" else definition.params.values()[i]
+		if not _direct_type(node.type) or not _direct_type(expected) or not _direct_return(node.type, expected):
+			return {}
+		var placeholder := "_optimizer_argument_%d" % i
+		while logical.contains(placeholder) or bindings.has(placeholder):
+			placeholder += "_"
+		placeholders.append(placeholder)
+		types[placeholder] = node.type
+		bindings[placeholder] = "(" + node.text + ")"
+		nodes.append(node)
+	if definition.reduction != "":
+		logical = (" " + definition.reduction + " ").join(placeholders)
+		if logical == "":
+			logical = "true" if definition.reduction == "and" else "false"
+	else:
+		var slots:Dictionary = {}
+		for i in placeholders.size():
+			slots[definition.params.keys()[i]] = placeholders[i]
+		logical = Body.rename(parser, logical, slots)
+	var slots_used:Array = parser.CodeEditParser.LambdaScanner._tokens(logical).map(func(token): return token.text)
+	for i in nodes.size():
+		if placeholders[i] in slots_used:
+			events.append_array(nodes[i].events)
+	var checked := _expression(logical, types, parser, site.line, site.column)
+	if checked.error != "" or not _direct_return(checked.type, definition.return_type):
+		return {}
+	var constants:Dictionary = {}
+	for i in nodes.size():
+		if nodes[i].text.is_valid_int() or nodes[i].text.is_valid_float():
+			constants[placeholders[i]] = "(" + nodes[i].text + ")"
+	if _expression(Body.rename(parser, logical, constants), types, parser, site.line, site.column).error == "constant zero divisor":
+		return {}
+	var text := "(" + Body.rename(parser, logical, bindings) + ")"
+	# Recheck literal arithmetic so substitution cannot introduce a compile-time zero divisor.
+	var locals := _local_types(call, parser, site)
+	var concrete := _expression(text, locals, parser, site.line, site.column)
+	if concrete.error == "constant zero divisor":
+		return {}
+	for nested:Dictionary in definition.nested:
+		var child := nested.duplicate()
+		child.depth += depth + 1
+		if child.depth >= MAX_DEPTH:
+			site.merge({"fatal": true, "reason": "inline depth limit"}, true)
+			return {}
+		events.append(child)
+	if parser.CodeEditParser.LambdaScanner._tokens(text).size() > MAX_TOKENS:
+		site.merge({"fatal": true, "reason": "inline token limit"}, true)
+		return {}
+	events.append(_event(definition, depth))
+	return {"text": text, "events": events, "type": checked.type}
 
 
 func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 	var call := _resolve_call(site, parser, path)
 	if call.is_empty():
 		return {}
-	var direct := _direct(site, parser, call)
-	if direct != "":
-		return {"start": site.start, "end": site.end, "text": direct, "mode": "direct", "stats": {"inline_substituted_args": call.args.size()}}
+	var direct := _direct_node(site, parser, call, path, false)
+	if not direct.is_empty():
+		return {"start": site.start, "end": site.end, "text": direct.text, "events": direct.events, "mode": "direct", "stats": {"inline_substituted_args": call.explicit_count}}
+	if site.get("fatal", false):
+		return {}
 	if not call.definition.template_eligible:
 		return {}
 	var line_start:int = source.rfind("\n", site.start - 1) + 1
@@ -345,7 +566,28 @@ func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 	var unique := "_inline_%d_" % site.start
 	while source.contains(unique):
 		unique += "_"
-	return _render_template(site, parser, call, unique, prefix, suffix, line_start, line_end)
+	var nested:Array = []
+	for i in call.args.size():
+		if i in call.default_indices:
+			continue
+		var composed := _compose_expression(call.args[i], parser, path, site.line, site.column, false, 1)
+		if composed.fatal:
+			site.reason = composed.reason
+			return {}
+		call.args[i] = composed.text
+		nested.append_array(composed.events)
+	if call.definition.rest != "":
+		nested = []
+		for i in call.supplied.size():
+			var composed := _compose_expression(call.supplied[i], parser, path, site.line, site.column, false, 1)
+			if composed.fatal:
+				return {}
+			call.supplied[i] = composed.text
+			nested.append_array(composed.events)
+	var rendered := _render_template(site, parser, call, unique, prefix, suffix, line_start, line_end)
+	if not rendered.is_empty():
+		rendered.events.append_array(nested)
+	return rendered
 
 
 func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, prefix:String, suffix:String, start:int, end:int) -> Dictionary:
@@ -353,6 +595,17 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 	var aliases := {"prefix": unique}
 	var bindings:Dictionary = {}
 	var captures:Array = []
+	var rest_bindings:Dictionary = {}
+	if definition.rest != "":
+		var raw_names:Array = []
+		for i in call.supplied.size():
+			var raw := unique + "supplied_%d" % i
+			captures.append("var %s = %s" % [raw, call.supplied[i]])
+			raw_names.append(raw)
+		var fixed:int = definition.params.size() - 1
+		for i in mini(fixed, raw_names.size()):
+			rest_bindings[i] = raw_names[i]
+		rest_bindings[fixed] = "[" + ", ".join(raw_names.slice(fixed)) + "]"
 	var stats := {"inline_substituted_args": 0, "inline_captured_args": 0, "inline_repeated_access_captures": 0}
 	var caller = parser.get_class_object(parser.get_class_at_line(site.line))
 	for name:String in definition.globals:
@@ -368,7 +621,7 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 		var name:String = names[i]
 		var argument:String = call.args[i].strip_edges()
 		var expected:String = definition.params[name]
-		var is_default:bool = i >= call.explicit_count
+		var is_default:bool = i in call.default_indices
 		if is_default:
 			var globals:Dictionary = {}
 			for key:String in definition.defaults[name].globals:
@@ -407,7 +660,7 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 				site.reason = "incompatible argument type for " + name
 				return {}
 		var usage:Dictionary = definition.uses[name]
-		var captured:bool = (not stable or actual != expected or usage.rebound
+		var captured:bool = (definition.rest != "" or not stable or actual != expected or usage.rebound
 			or (definition.runtime_arithmetic and (argument.is_valid_int() or argument.is_valid_float()))
 			or (usage.written and not Body.TypeInfo.is_reference(expected))
 			or (definition.effectful and Body.TypeInfo.is_reference(expected)))
@@ -416,7 +669,7 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 			captured = true
 		if captured:
 			bindings[name] = unique + name
-			captures.append("var %s:%s = %s" % [bindings[name], Body.TypeInfo.emit(expected, parser, aliases), argument])
+			captures.append("var %s:%s = %s" % [bindings[name], Body.TypeInfo.emit(expected, parser, aliases), rest_bindings.get(i, argument)])
 			stats.inline_captured_args += 1
 			if lookup and usage.count > 1:
 				stats.inline_repeated_access_captures += 1
@@ -477,7 +730,16 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 	lines.append(prefix + "(" + bridge + " as " + return_type + ")" + suffix)
 	if prefix.strip_edges() != "return":
 		lines.append(indent + bridge + " = null")
-	return {"start": start, "end": end, "text": "\n".join(lines), "mode": "expanded", "stats": stats}
+	var events:Array = []
+	for event:Dictionary in definition.nested:
+		var child := event.duplicate()
+		child.depth += 1
+		if child.depth >= MAX_DEPTH:
+			site.reason = "inline depth limit"
+			return {}
+		events.append(child)
+	events.append(_event(definition, 0, "expanded"))
+	return {"start": start, "end": end, "text": "\n".join(lines), "mode": "expanded", "stats": stats, "events": events}
 
 
 func _local_data(call:Dictionary, name:String) -> Dictionary:

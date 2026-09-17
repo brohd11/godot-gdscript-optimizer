@@ -2,7 +2,7 @@ extends RefCounted
 ## Export defaults are separate from Context's conservative programmatic defaults.
 
 const YAML = preload("res://addons/addon_lib/yaml_parser/yaml.gd") #! ignore-remote
-const DEFAULTS = {"structs": true, "inline_functions": true, "scalar_replacement": true,
+const DEFAULTS = {"debug_tags": false, "structs": true, "inline_functions": true, "scalar_replacement": true,
 	"struct_read_types": "typed_locals", "scalar_replacement_allow_ref_counted": false, "struct_read_types_allow_ref_counted": false,
 	"inline_functions_allow_ref_counted": false, "inline_functions_allow_variants": false}
 const READ_MODES = ["off", "typed_locals", "as_casts"]

@@ -14,6 +14,7 @@ var map_path:Callable
 var scan_references:Callable
 var injection_header:String = "### GDScript Optimizer Structs"
 var source_snapshots:Dictionary = {}
+var debug_tags:bool = false
 var scalar_replacement:bool = false
 var scalar_replacement_allow_ref_counted:bool = false
 var struct_read_types_allow_ref_counted:bool = false

@@ -121,7 +121,7 @@ parameter/return conversions and checks can disappear, changing results or error
 Unknown runtime values may themselves contain references; statically known reference
 types still require the reference flag. Both flags default to false and affect only
 direct substitution. Calls, properties, and indexed expressions supplied as arguments
-remain ineligible, even with both flags enabled. The same flag names are YAML keys.
+require the helper’s `substitute` tag; the type flags alone do not permit them. The same flag names are YAML keys.
 
 The template path supports explicit built-in value types, Array/Dictionary (including
 typed collections), RefCounted, and typed RefCounted-derived scripts. Tagged structs
@@ -160,8 +160,8 @@ the omitted-argument call unchanged; explicitly supplying that argument remains 
 Calls use a script constant/global class, or a direct call inside another static
 function in the same script. Original definitions remain intact. Template Variant declarations,
 loops, arbitrary early returns, lambdas/await in imported bodies, mutable external
-bindings, and nested inlining remain unsupported. Ambiguous/unsupported sites stay
-unchanged with diagnostics. No expansion is hoisted from a larger expression.
+bindings, remain unsupported in templates. Ambiguous/unsupported sites stay
+unchanged with diagnostics. No statement expansion is hoisted from a larger expression.
 A single-iteration loop plus result/break for general early returns is a follow-up
 experiment; its control-flow cost needs a separate benchmark.
 
@@ -176,3 +176,46 @@ Predicate benchmark (original versus transformed code, median microseconds and c
 `godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_expression.gd -- 200000 7`.
 It reports typed and Variant callers with the Variant opt-in disabled/enabled; timings
 exclude optimization, compilation, startup, and warmup. No fixed speedup is asserted.
+
+## Substitution, variadic helpers, and nested calls
+
+```gdscript
+#! inline; substitute
+static func all_values(...values:Array) -> bool:
+    for value in values:
+        if not value:
+            return false
+    return true
+```
+
+`all_values(get_cond(), node.get_cond())` can become
+`(get_cond() and node.get_cond())`. The tag authorizes skipping, duplicating, and
+reordering supplied expressions, according to parameter use in the helper. It does
+not disable type checks: Variant/reference eligibility still uses the separate config
+flags. A bool-returning method can be substituted without enabling reference types.
+Normal inline only skips/repeats proven safe arguments; unknown methods/getters and
+potentially throwing expressions stay calls or use existing eager template captures.
+Await/lambda arguments remain excluded.
+
+Rest parameters (`...args` or `...args:Array`) retain fixed/default argument binding.
+Templates evaluate supplied arguments once in order before conversions and create a
+fresh rest Array. The recognized all/any reductions have one rest parameter, one loop,
+an immediate false/true return under `if not value`/`if value`, and the opposite final
+return. Empty all is true; empty any is false. Recognition is structural, independent
+of names. Other loops and the existing array-based Bool API are not rewritten.
+
+Eligible expression children expand inside call arguments and private helper/template
+copies; original definitions remain intact. Child substitution does not grant an
+ordinary parent permission to duplicate an effectful result. Cycles, expansion depth
+above 16, or expressions exceeding 4,096 tokens leave calls with diagnostics. Nested
+helpers requiring new statement blocks remain deferred.
+
+Set `debug_tags: true` in YAML, or `context.debug_tags = true`, to mark successful
+inline, struct, scalar, and typed-read/cast sites with searchable `# optimizer-*;`
+comments. Markers sit at logical statement boundaries and record source provenance;
+inline markers include helper identity, mode, options and depth. Default is false.
+
+Evaluation-aware benchmark:
+`godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_composition.gd -- 100000 7`.
+It checks both result counts and the different expected call counts for ordinary and
+substituted helpers before reporting median timings.

@@ -8,6 +8,7 @@ const Rewrite = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct
 var stats:Dictionary = {"scalar_structs": 0, "scalar_accesses": 0, "scalar_skipped": 0,
 	"struct_typed_captures": 0, "struct_read_casts": 0, "struct_reads_skipped": 0}
 var warnings:Array = []
+var debug_events:Array = []
 var declarations:Dictionary = {}
 var prefixes:Dictionary = {}
 var _scalars:Dictionary = {}
@@ -157,6 +158,7 @@ func _find_scalars() -> void:
 		else:
 			_scalars[line] = candidate
 			stats.scalar_structs += 1
+			debug_events.append({"line": line, "kind": "scalar-replacement", "details": {"struct": candidate.path, "mode": "declaration"}})
 
 
 func _assess(candidate:Dictionary) -> String:
@@ -304,6 +306,7 @@ func replacement(path:String, field:String, receiver:String, lowered:String, lin
 			var scalar:Dictionary = _scalars[binding]
 			if scalar.name == receiver and scalar.path == path:
 				stats.scalar_accesses += 1
+				debug_events.append({"line": line, "kind": "scalar-replacement", "details": {"field": field, "mode": "access"}})
 				return scalar.fields[field].name
 	if _mode == 0:
 		return lowered
@@ -340,11 +343,13 @@ func replacement(path:String, field:String, receiver:String, lowered:String, lin
 		return lowered
 	if _mode == 2:
 		stats.struct_read_casts += 1
+		debug_events.append({"line": line, "kind": "struct-read", "details": {"field": field, "mode": "as_casts"}})
 		return "(%s as %s)" % [lowered, type]
 	var name := _prefix + "read_%d_%d" % [line, start]
 	var indent := code.substr(0, Rewrite._indent_of(code))
 	prefixes.get_or_add(line, []).append(indent + "var %s: %s = %s" % [name, type, lowered])
 	stats.struct_typed_captures += 1
+	debug_events.append({"line": line, "kind": "struct-read", "details": {"field": field, "mode": "typed_locals"}})
 	return name
 
 

@@ -153,9 +153,13 @@ func _primary() -> Dictionary:
 	while _peek() in [".", "["]:
 		var postfix_start:int = _tokens[_index].start
 		var receiver_type:String = value.type
+		var known_type := ""
 		var dynamic:bool = receiver_type == "Variant" and _variants
 		var reference:bool = reference_type(receiver_type) and _references
 		if _peek() == "[":
+			if receiver_type.contains("["):
+				var elements:Array = _parser.Utils.GDScriptParse.safe_split_args(receiver_type.substr(receiver_type.find("[") + 1).trim_suffix("]"))
+				known_type = elements[-1].strip_edges() if not elements.is_empty() else ""
 			_index += 1
 			_binary(0)
 			if not _take("]"):
@@ -169,6 +173,7 @@ func _primary() -> Dictionary:
 				_error = "missing member name"
 				return value
 			_index += 1
+			known_type = _member_type(receiver_type, member)
 			var arguments:Array = []
 			var method:bool = _peek() == "("
 			if method:
@@ -191,9 +196,19 @@ func _primary() -> Dictionary:
 				_error = "member expression requires reference or Variant opt-in"
 		value.end = _tokens[_index - 1].end
 		value.lookup += _source.substr(postfix_start, value.end - postfix_start)
-		value.type = "Variant" if dynamic else Types.expression_type(_parser, value.lookup, _line, _column)
+		value.type = "Variant" if dynamic else (known_type if known_type != "" else Types.expression_type(_parser, value.lookup, _line, _column))
 		if value.type == "":
 			value.type = "Variant"
 		if not admitted(value.type, _references, _variants):
 			_error = "member result type is not enabled: " + value.type
 	return value
+
+
+func _member_type(type:String, member:String) -> String:
+	if type.contains(".gd"):
+		var parts := type.split("::", true, 1)
+		var dependency = _parser.get_parser_for_path(parts[0])
+		var owner = dependency.get_class_object(parts[1].replace("::", ".") if parts.size() > 1 else "")
+		if owner != null:
+			return owner.get_member_type(member, true).trim_suffix(_parser.Keys.INS_DELIM).replace(".gd.", ".gd::")
+	return _parser.BuiltInChecker.get_member_type(type.get_slice("[", 0), member)

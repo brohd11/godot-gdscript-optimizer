@@ -2,6 +2,7 @@ extends RefCounted
 ## Plans against original sources, then replays edits on a consumer's output text.
 ## Path relocation and surviving global names belong to the processing context.
 
+const DebugTags = preload("res://addons/addon_lib/gdscript_optimizer/debug_tags.gd")
 const TagRegistry = preload("res://addons/addon_lib/tag_parser/registry.gd")
 const StructRewrite = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
 const StructTypes = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_types.gd")
@@ -133,7 +134,8 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 	if ops.is_empty() and bodies.is_empty() and injected.is_empty():
 		return {}
 	return {"ops": ops, "bodies": bodies, "injected": injected,
-		"stats": optimization.stats if optimization != null else {}}
+		"stats": optimization.stats if optimization != null else {},
+		"debug_events": optimization.debug_events if optimization != null else [], "source": source}
 
 
 ## Files whose references reach a struct script. Only these can hold a value the parser types as a
@@ -222,6 +224,17 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 		return {"lines": input_lines, "errors": []}
 	var lines = input_lines.duplicate()
 	var errors = StructRewrite.apply_ops(lines, plan.ops)
+	var events:Array = []
+	if _context.debug_tags:
+		events = plan.debug_events.duplicate(true)
+		for line:int in plan.ops:
+			for op:Array in plan.ops[line]:
+				if op[0] != op[1]:
+					events.append({"line": line, "kind": "struct", "details": {"mode": "rewrite"}})
+		for body:Dictionary in plan.bodies:
+			events.append({"line": body.start, "kind": "struct", "details": {"mode": "lower", "class": body.class_path}})
+		for event:Dictionary in events:
+			event.details.site = "%s:%d" % [plan.source, event.line + 1]
 	for body in plan.bodies:
 		if body.start >= lines.size() or lines[body.start] != body.expect:
 			errors.append("could not find the body of %s" % body.class_path)
@@ -230,6 +243,11 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 		edited.append_array(body.lines)
 		edited.append_array(lines.slice(body.end + 1))
 		lines = edited
+		for event:Dictionary in events:
+			if event.line > body.end:
+				event.line += body.lines.size() - (body.end - body.start + 1)
+			elif event.line >= body.start:
+				event.line = body.start
 	if not errors.is_empty():
 		return {"lines": input_lines, "errors": errors}
 
@@ -243,5 +261,17 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 			var line = 'const %s = preload("%s")' % [name, _context.output_path(inj.key)]
 			if inj.tail != "":
 				line += "." + inj.tail
+			if _context.debug_tags:
+				events.append({"line": lines.size(), "kind": "struct", "details": {"mode": "dependency", "site": plan.source}})
 			lines.append(line)
-	return {"lines": Array("\n".join(lines).split("\n")), "errors": [], "stats": plan.get("stats", {})}
+	var offsets:Array = []
+	var physical := 0
+	for line:String in lines:
+		offsets.append(physical)
+		physical += line.count("\n") + 1
+	for event:Dictionary in events:
+		event.line = offsets[event.line]
+	var output:Array = Array("\n".join(lines).split("\n"))
+	if _context.debug_tags:
+		output = DebugTags.annotate(output, events)
+	return {"lines": output, "errors": [], "stats": plan.get("stats", {})}
