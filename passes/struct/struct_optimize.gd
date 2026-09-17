@@ -74,7 +74,7 @@ func _supported_type(type:String, allow_references:bool) -> bool:
 	if type.contains("["):
 		if type.get_slice("[", 0) not in ["Array", "Dictionary"]:
 			return false
-		for arg:String in _types.parser.Utils.GDScriptParse.safe_split_args(type.substr(type.find("[") + 1).trim_suffix("]")):
+		for arg:String in _types.parser.Utils.MemberParse.safe_split_args(type.substr(type.find("[") + 1).trim_suffix("]")):
 			if arg.strip_edges() != "Variant" and not _supported_type(arg.strip_edges(), allow_references):
 				return false
 		return true
@@ -86,7 +86,7 @@ func _emit_type(type:String) -> String:
 		return "Array"
 	if type.contains("["):
 		var parts:Array[String] = []
-		for arg:String in _types.parser.Utils.GDScriptParse.safe_split_args(type.substr(type.find("[") + 1).trim_suffix("]")):
+		for arg:String in _types.parser.Utils.MemberParse.safe_split_args(type.substr(type.find("[") + 1).trim_suffix("]")):
 			var element := _emit_type(arg.strip_edges())
 			if element.is_empty():
 				return ""

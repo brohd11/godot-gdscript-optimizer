@@ -334,7 +334,7 @@ func _resolve_call(site:Dictionary, parser, path:String, inside:bool = false) ->
 			return {}
 	elif locals.has(callee) or not function.is_static() or path != definition.file:
 		return {}
-	var supplied:Array = _context.parser_script.Utils.GDScriptParse.safe_split_args(site.args)
+	var supplied:Array = _context.parser_script.Utils.MemberParse.safe_split_args(site.args)
 	if site.args.strip_edges().is_empty():
 		supplied = []
 	var fixed:int = definition.params.size() - int(definition.rest != "")

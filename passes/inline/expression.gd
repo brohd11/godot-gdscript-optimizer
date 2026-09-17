@@ -158,7 +158,7 @@ func _primary() -> Dictionary:
 		var reference:bool = reference_type(receiver_type) and _references
 		if _peek() == "[":
 			if receiver_type.contains("["):
-				var elements:Array = _parser.Utils.GDScriptParse.safe_split_args(receiver_type.substr(receiver_type.find("[") + 1).trim_suffix("]"))
+				var elements:Array = _parser.Utils.MemberParse.safe_split_args(receiver_type.substr(receiver_type.find("[") + 1).trim_suffix("]"))
 				known_type = elements[-1].strip_edges() if not elements.is_empty() else ""
 			_index += 1
 			_binary(0)

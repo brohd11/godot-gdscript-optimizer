@@ -6,7 +6,7 @@ const UtilsRemote = preload("res://addons/addon_lib/gdscript_optimizer/utils_rem
 
 enum StructReadTypes { OFF, TYPED_LOCALS, AS_CASTS }
 
-var parser_script:GDScript = UtilsRemote.GDScriptParser
+var parser_script:GDScript = preload("res://addons/addon_lib/gdscript_parser/gdscript_parser.gd") #! resolve GDScriptParser
 var class_list:Dictionary = {}
 var class_path_lookup:Dictionary = {}
 var removed_globals:Dictionary = {}

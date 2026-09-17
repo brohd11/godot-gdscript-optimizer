@@ -11,7 +11,7 @@ static func normalize(type:String, parser, line:int) -> String:
 		var base := type.get_slice("[", 0)
 		if base not in ["Array", "Dictionary"]:
 			return ""
-		var args:Array = parser.Utils.GDScriptParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]"))
+		var args:Array = parser.Utils.MemberParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]"))
 		var parts:Array = []
 		for arg:String in args:
 			parts.append(normalize(arg.strip_edges(), parser, line))
@@ -39,7 +39,7 @@ static func supported(type:String, parser) -> bool:
 		var base := type.get_slice("[", 0)
 		if base not in ["Array", "Dictionary"]:
 			return false
-		for arg:String in parser.Utils.GDScriptParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]")):
+		for arg:String in parser.Utils.MemberParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]")):
 			if arg.strip_edges() != "Variant" and not supported(arg.strip_edges(), parser):
 				return false
 		return true
@@ -62,7 +62,7 @@ static func emit(type:String, parser, aliases:Dictionary) -> String:
 	if type.contains("["):
 		var base := type.get_slice("[", 0)
 		var parts:Array = []
-		for arg:String in parser.Utils.GDScriptParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]")):
+		for arg:String in parser.Utils.MemberParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]")):
 			parts.append(emit(arg.strip_edges(), parser, aliases))
 		return base + "[" + ", ".join(parts) + "]"
 	if type.contains(".gd"):
