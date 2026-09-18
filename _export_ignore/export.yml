@@ -1,0 +1,56 @@
+export_root: "res://addons/addon_lib/gdscript_optimizer/_export_ignore/exports"
+plugin_folder: "GdscriptOptimizer{{version=res://addons/addon_lib/gdscript_optimizer}}"
+pre_script: "res://addons/addon_lib/gdscript_optimizer/_export_ignore/pre_post_export.gd"
+post_script: "res://addons/addon_lib/gdscript_optimizer/_export_ignore/pre_post_export.gd"
+build_require: "@require"
+compile_require: []
+options:
+  overwrite: true
+  include_uid: true
+  include_import: true
+  ignore_src: true
+  use_tag_in_cfg: true
+  exported_deps: []
+  include_min_version: true
+  move_global_files: true
+  include_docs: true
+  include_project_license: false
+  parser_settings:
+    use_relative_paths: false
+    backport_target: 100
+    parse_cs:
+      namespace_rename: {}
+    parse_gd:
+      replace_editor_interface: false
+      optimizer:
+        debug_tags: false
+        structs: true
+        inline_functions: true
+        scalar_replacement: true
+        struct_read_types: typed_locals
+        scalar_replacement_allow_ref_counted: false
+        struct_read_types_allow_ref_counted: false
+        inline_functions_allow_ref_counted: false
+        inline_functions_allow_variants: false
+        enabled: true
+      class_rename_ignore: []
+      backport_string_renames: {}
+    parse_tscn: {}
+    parse_tres: {}
+exports:
+  -
+    source: "res://addons/addon_lib/gdscript_optimizer"
+    export_name: "gdscript-optimizer{{version=res://addons/addon_lib/gdscript_optimizer}}"
+    export_folder: addons/addon_lib/gdscript_optimizer
+    exclude:
+      directories:
+        - "res://addons/addon_lib/gdscript_optimizer/_export_ignore"
+      file_extensions: []
+      files: []
+    other_transfers: []
+    parser_overide_settings:
+      parse_cs: {}
+      parse_gd: {}
+      parse_tscn: {}
+      parse_tres: {}
+    remote_dir: "res://addons/addon_lib/gdscript_optimizer/src/remote"
