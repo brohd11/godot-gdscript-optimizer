@@ -39,58 +39,59 @@ definitions and cross-file type resolution see the same post-struct snapshots.
 Consumers must preserve planned locations until replay, or treat conflicts as errors.
 No writes, export lifecycle methods, or editor reporting belong in a pass.
 
-## Optional struct optimizations
+## Optimization policy
 
-```gdscript
-context.scalar_replacement = true
-context.struct_read_types = Optimizer.Context.StructReadTypes.TYPED_LOCALS
-# Alternatives: OFF (default), AS_CASTS.
-context.scalar_replacement_allow_ref_counted = false
-context.struct_read_types_allow_ref_counted = false
+```yaml
+struct_mode: tagged # auto | tagged | off
+inline_mode: tagged # auto | tagged | off
+aggressive: false
+debug_tags: false
 ```
 
-These settings extend `StructPass`; neither changes default output. Scalar replacement
-plans against original bindings before lowering and inlining. It eliminates direct local
-struct constructors only when all uses are field accesses and every field has a proven
-built-in value type (explicit or `:=`). It supports branches, loops, field assignments,
-compound updates, and value-component writes. Constructor arguments evaluate once in order
-before parameter conversions. Field initialization and conversion remain typed.
+`tagged` considers explicitly tagged definitions; `auto` discovers eligible definitions;
+`off` disables the pass even for tagged definitions. `#! struct; off` and `#! inline; off`
+exclude individual definitions from discovery. Missing settings inherit the defaults above.
+Unknown keys and invalid values are errors; there are no legacy configuration aliases.
 
-By default, reference/dynamic fields, aliases, reassignment, whole-value uses, captures, coroutines,
-multiline constructors, and unresolved/effectful defaults stay in the existing Array form.
-Supported defaults are literals and built-in value constructors with immutable inputs.
+`Optimizer.Config.from_file(path = "")` loads one YAML mapping using YAMLParser;
+`from_dictionary(data)` validates an in-memory mapping. Both return `{options, errors}`.
+Use `context.configure(options)` to apply validated defaults and overrides; it returns errors.
+Context exposes `struct_mode`, `inline_mode`, `aggressive`, and `debug_tags` directly too.
+The explicit pass list still selects which passes run; modes cannot enable an omitted pass.
+
+Auto discovery uses parsed declarations without changing source tags. It considers file-level
+and nested data classes, and top-level static functions. Explicit tags retain their identity
+and permissions. Unsupported automatic candidates are skipped; malformed explicit struct
+contracts remain preflight errors. Supply all participating sources so use checks can run.
+
+## Struct optimization
+
+Structs contain fields and optionally a simple `_init` assigning arguments to fields.
+Other methods, unsupported inheritance, accessors, and unsupported syntax prevent conversion.
+Conservative mode requires proven value fields (explicit types or `:=`). Reference,
+Variant, and unresolved fields exclude the whole class. Aggressive mode admits supported
+reference and Variant fields, but retains constructor and usage checks. Automatically found
+classes with unsupported Object operations or untyped/unresolved escapes remain objects.
+Candidates are removed and revalidated before any edits are emitted.
+
+Scalar replacement and typed-local field reads are always attempted for selected structs.
+Scalar replacement removes nonescaping local allocations whose fields have representable
+types and defaults. Aliases, reassignment, whole-value uses, captures, coroutine lifetimes,
+and unsuitable constructors keep the Array form. Arguments evaluate once in order.
 Scalarization after inline expansion is deferred.
 
-For remaining field reads, `TYPED_LOCALS` inserts typed captures only at supported statement
-sites with safe evaluation order. It skips conditional/multiline evaluation, mixed calls,
-complex receivers, and writes. `AS_CASTS` wraps reads in `(receiver[S.FIELD] as T)` without
-moving them; it skips writes, multiline statements, and inline lambdas/semicolon statements.
-By default both use the same built-in value types as the inliner. No repeated-read caching is performed.
+Remaining field reads use typed captures at supported statement sites with safe evaluation
+order. Conditional evaluation, mixed calls, complex receivers, and writes are skipped.
+The optimizer never generates field-read casts. Aggressive mode admits reference types
+for captures and scalar locals; this can extend lifetimes and change runtime checks.
+Unknown field types still cannot be scalarized or captured. Mutable defaults are separate
+per instance, and effectful defaults remain excluded from scalar replacement.
 
-`scalar_replacement_allow_ref_counted` and `struct_read_types_allow_ref_counted`
-independently admit known Object/Node/RefCounted and script types, collections, packed
-arrays, Callable, Signal, and nested structs in their respective optimization.
-This opt-in can prolong reference lifetimes and add runtime checks on freed objects.
-Escape/evaluation-order checks and the inliner's type rules remain unchanged. Scalar
-initializers additionally accept null, literal collections, and empty built-in constructors;
-mutable defaults are created per instance. Effectful or incompatible defaults still skip.
-Cross-file type names use dependency aliases and output-path mapping; nested structs emit
-Array. Surviving collection reads use Array/Dictionary because lowering can erase element
-metadata; scalar declarations preserve typed collections. Unknown types are skipped.
-
-`Optimizer.Config.from_file(path = "")` loads one YAML mapping using the required YAMLParser dependency,
-returning `{options, errors}`. `from_dictionary(data)` validates an in-memory mapping.
-Export defaults enable structs, inline_functions, scalar_replacement, and typed_locals;
-All reference and Variant opt-ins stay false. The old `allow_ref_counted` key is rejected;
-replace it with the two struct flags above. Missing keys inherit defaults, and invalid/unknown options
-produce errors with no usable options. `struct_read_types` accepts off, typed_locals,
-or as_casts and normalizes to the Context enum. Context and prepare defaults are unchanged;
-other hosts must explicitly select these export defaults.
-
-Stats are `scalar_structs`, `scalar_accesses`, `scalar_skipped`, `struct_typed_captures`,
-`struct_read_casts`, and `struct_reads_skipped`. They count source sites, not runtime work.
-Skipped scalar candidates and unsafe capture sites produce diagnostic reasons. Consumers
-must benchmark their workloads: typed casts/captures can cost more than they save.
+Preparation counts are available in `optimizer.stats`: `struct_candidates`,
+`struct_eligible`, `struct_candidates_skipped`, `inline_candidates`, `inline_eligible`,
+and `inline_definitions_skipped`. Replay adds `scalar_structs`, `scalar_accesses`,
+`scalar_skipped`, `struct_typed_captures`, and `struct_reads_skipped`, plus inline counts.
+Counts describe source sites, not runtime work or guaranteed speedups.
 
 ## Static function inlining
 
@@ -106,34 +107,45 @@ against its input buffer, including line changes made by the struct pass.
 
 Preflight assesses each tagged function once; replay chooses one of two paths.
 The direct path supports a single returned expression, including parenthesized multiline
-returns. It accepts arithmetic (`+ - * / %`, unary `+ -`), comparisons, `and/or/not`,
-literals, parameters, and String `begins_with`, `ends_with`, `contains`, and `is_empty`.
+returns. It accepts
+arithmetic (`+ - * / %`, unary `+ -`), comparisons, `and/or/not`, String/StringName
+concatenation and literals, parameters, and String `begins_with`, `ends_with`, `contains`,
+`is_empty`, `get_slice`, `trim_prefix`, and `trim_suffix`.
 It substitutes matching literals or statically typed locals, retaining return types,
 precedence, and short-circuiting. Direct calls may appear in `if`, `elif`, `while`, and
-larger expressions. It emits no argument temporaries and skips omitted arguments.
+larger expressions. It emits no argument temporaries and supports immutable omitted defaults.
 
-`context.inline_functions_allow_ref_counted = true` permits direct reference types,
-including Object/Node, containers and script classes, with member/index reads and method
-calls. It removes parameter lifetime protection and may change aliasing behavior.
-`context.inline_functions_allow_variants = true` permits explicit/implicit Variant
-signatures and Variant locals passed to typed parameters. Substitution is unchecked:
-parameter/return conversions and checks can disappear, changing results or errors.
-Unknown runtime values may themselves contain references; statically known reference
-types still require the reference flag. Both flags default to false and affect only
-direct substitution. Calls, properties, and indexed expressions supplied as arguments
-require the helper’s `substitute` tag; the type flags alone do not permit them. The same flag names are YAML keys.
+Static references retain their defining scope in both paths: constants, enums, nested types,
+static variable reads/writes, and static method calls are supported. For example,
+`Utils.add_type(value, type)` can become `(value + Utils.Keys.TYPE_DELIM + type)`.
+Calls within the defining class retain bare member names unless a caller local shadows them.
+External calls reuse their receiver; inaccessible names use verified aliases or template
+preloads. Untagged static methods remain calls. Static state and calls remain effectful
+when an expanded child is considered for substitution into an ordinary parent.
 
-The template path supports explicit built-in value types, Array/Dictionary (including
-typed collections), RefCounted, and typed RefCounted-derived scripts. Tagged structs
-work as objects with inline alone and as arrays with StructPass followed by InlinePass.
-Value types include bool, int, float, String, StringName, NodePath, Vector2/3/4 and
-integer variants, Rect2/Rect2i, Transform2D/3D, Plane, Quaternion, AABB, Basis,
-Projection, Color, and RID. Node/raw Object and packed-array extensions are deferred.
+Conservative inlining requires supported value-type signatures. It preserves argument
+order, conversions, and required captures. `aggressive: true` additionally admits supported
+reference/Variant signatures and uses substitute-style conversion and lifetime reductions.
+Arguments still must be proven before nested rewriting: any unproven call, getter, or index
+argument leaves an aggressive call unchanged unless its helper explicitly has
+`#! inline; substitute`. Simple local arguments and proven pure expressions qualify.
+
+The explicit substitute tag overrides conservative eligibility for that helper and permits
+skipped, repeated, or reordered arguments. A plain inline tag does not grant this permission,
+and an inner helper's tag does not grant permission to an outer helper. Off modes and local
+exclusions still win. Depth, cycle, size, syntax, and constant-divisor checks always apply.
+
+The template path supports built-in value types. Aggressive or substitute templates also
+support Array/Dictionary, typed collections, reference objects, Variant, packed arrays,
+Callable, and Signal where their operations are supported.
 
 Preflight records parameter token slots, reference counts, rebinding, field/index
 writes, and calls. Bodies may declare typed/inferred locals, assign locals/parameters
 or their fields, and use nested if/elif/else branches. Value-returning helpers must
-finish with a return or an exhaustive terminal return tree. Explicit `-> void` helpers allow early bare returns,
+finish with a return or an exhaustive terminal return tree. Return-only guard clauses
+with a final fallback become terminal `if`/`elif`/`else` branches, preserving condition order.
+The optimizer does not generate ternaries from branches; conditional helpers embedded
+in larger expressions remain calls. Explicit `-> void` helpers allow early bare returns,
 `pass`, and normal fallthrough. Every statement must occupy one line.
 Immutable constants and script/type aliases retain their defining scope.
 
@@ -149,16 +161,24 @@ Replay chooses bindings separately for each parameter:
 - Numeric conversions retain typed bindings. Effectful unused arguments still execute.
 
 Expanded calls must be the whole initializer of a local declaration, assignment to a
-simple local/parameter, or return. Argument/body locals live in a generated block.
-A typed result crosses that block through a temporary Variant, is cast back to retain
-`:=` inference, and the bridge is cleared after assignment. Imported locals therefore
-do not extend reference lifetimes to the end of the caller.
+simple local/parameter, or return. Terminal branches assign an existing local directly
+when its type preserves return conversion and no imported reference needs cleanup first.
+Eligible declarations are emitted before the branches and assigned directly: `var x`
+stays Variant, `:=` gets the helper's return type, and explicit annotations are retained.
+One result slot remains when return conversion, cleanup, or initializer shadowing requires it.
+Conditional expansions needing both a result slot and a reference-cleanup bridge remain calls.
+Required argument captures and body locals are separate from this result-slot limit.
+Tail-call expansions emit returns directly when conversion and cleanup permit it.
+Argument/body locals live in a generated block only when scope is needed. Reference
+results retain a temporary Variant bridge, cast and cleared after assignment, so imported
+locals do not extend reference lifetimes to the end of the caller. Type annotations reuse
+unshadowed caller aliases with matching resolved identities; other types use preload aliases.
 
 Only void bodies use a generated `for <unique_name> in 1:` loop; bare returns become
 breaks. These helpers expand at standalone call statements without a result or bridge.
-Value-returning guard-clause helpers remain calls: the benchmark showed little gain
-from the result/bridge wrapper, so that expansion is deliberately unsupported.
-Existing direct expressions and terminal return trees retain their previous lowering.
+Value-returning guards consisting only of conditions and returns become terminal branches.
+Guards with local assignments or standalone effects remain calls; result/bridge loops
+for value-returning helpers remain unsupported.
 With `debug_tags: true`, wrapper sites include `control_flow="single_iteration"`.
 
 Omitted defaults support literals/null, value constructors with constant inputs, and
@@ -166,9 +186,9 @@ resolvable immutable value constants. Mutable collection or executable defaults 
 the omitted-argument call unchanged; explicitly supplying that argument remains eligible.
 
 Calls use a script constant/global class, or a direct call inside another static
-function in the same script. Original definitions remain intact. Template Variant declarations,
-loops, match, lambdas/await in imported bodies, mutable external
-bindings, remain unsupported in templates. Ambiguous/unsupported sites stay
+function in the same script. Original functions remain available. Template Variant declarations
+require aggressive mode or `substitute`. Loops, match, lambdas/await, and instance-dependent external
+bindings remain unsupported in templates. Ambiguous/unsupported sites stay
 unchanged with diagnostics. No statement expansion is hoisted from a larger expression.
 Loops inside imported bodies remain unsupported because a rewritten break would
 otherwise exit the inner loop. Calls inside a caller's loop are supported.
@@ -177,7 +197,7 @@ Replay stats expose `inline_calls`, `inline_skipped`, `inline_direct_calls`,
 `inline_expanded_calls`, `inline_early_return_calls` (a subset of expanded calls),
 `inline_substituted_args`, `inline_captured_args`, and
 `inline_repeated_access_captures`. Counts describe source sites, not runtime invocations.
-Tagging is opt-in: removal of call overhead does not guarantee a speedup for every body.
+Default discovery is tagged: removal of call overhead does not guarantee a speedup for every body.
 
 Tests: `godot --headless --path . --script res://tests/gdscript_optimizer/run_headless.gd`.
 
@@ -206,9 +226,15 @@ static func all_values(...values:Array) -> bool:
 
 `all_values(get_cond(), node.get_cond())` can become
 `(get_cond() and node.get_cond())`. The tag authorizes skipping, duplicating, and
-reordering supplied expressions, according to parameter use in the helper. It does
-not disable type checks: Variant/reference eligibility still uses the separate config
-flags. A bool-returning method can be substituted without enabling reference types.
+reordering supplied expressions, according to parameter use in the helper. This is a
+per-helper override of the global aggressive setting, for direct and expanded
+inlining. Parameter checks/conversions and strong reference captures can disappear;
+direct assignment can also remove the helper's return conversion. Result/bridge storage
+used solely for reference lifetime protection is omitted even with imported reference locals.
+The author accepts
+changes to evaluation, errors, aliasing, and destructor timing. Rebound parameters and
+mutated value parameters still get local storage to avoid writing back to the caller.
+Unsupported syntax and control flow remain excluded.
 Normal inline only skips/repeats proven safe arguments; unknown methods/getters and
 potentially throwing expressions stay calls or use existing eager template captures.
 Await/lambda arguments remain excluded.
@@ -221,13 +247,13 @@ return. Empty all is true; empty any is false. Recognition is structural, indepe
 of names. Other loops and the existing array-based Bool API are not rewritten.
 
 Eligible expression children expand inside call arguments and private helper/template
-copies; original definitions remain intact. Child substitution does not grant an
+copies; original functions remain available. Child substitution does not grant an
 ordinary parent permission to duplicate an effectful result. Cycles, expansion depth
 above 16, or expressions exceeding 4,096 tokens leave calls with diagnostics. Nested
 helpers requiring new statement blocks remain deferred.
 
 Set `debug_tags: true` in YAML, or `context.debug_tags = true`, to mark successful
-inline, struct, scalar, and typed-read/cast sites with searchable `# optimizer-*;`
+inline, struct, scalar, and typed-read sites with searchable `# optimizer-*;`
 comments. Markers sit at logical statement boundaries and record source provenance;
 inline markers include helper identity, mode, options and depth. Default is false.
 

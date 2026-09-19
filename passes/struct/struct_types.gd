@@ -37,7 +37,7 @@ func _init(parser_script:GDScript, source:String, p_structs:Dictionary, cache:Di
 func lookups() -> Dictionary:
 	return {
 		"type_of": type_of, "raw_type": raw_type, "return_raw": return_raw, "params": params,
-		"lambda_params": lambda_params, "lambda_body": lambda_body,
+		"lambda_params": lambda_params, "lambda_body": lambda_body, "parameter_types": parameter_types,
 	}
 
 
@@ -100,9 +100,36 @@ func return_raw(line:int, column:int = -1) -> String:
 	return function.get_return_type_raw().trim_suffix(_ins)
 
 
+func _function_arguments(callee:String, line:int, column:int = -1) -> Dictionary:
+	var origin:String = parser.resolve_expression_to_type_rich(callee, line, column).get("origin", "")
+	if parser.Utils.is_absolute_path(origin) and origin.ends_with(parser.Keys.CALLABLE_SUFFIX):
+		var data:Dictionary = parser.get_parser_and_class_obj_for_script(origin)
+		var owner = data.get("class_obj")
+		if owner == null:
+			return {}
+		var function = owner.get_function(parser.Utils.type_path_get_member(origin))
+		if function == null:
+			return {}
+		return {"args": function.get_arguments(), "parser": data.parser, "line": function.declaration_line}
+	var arguments:Variant = parser.get_function_data(callee, line).get(&"func_args")
+	return {"args": arguments, "parser": parser, "line": line} if arguments is Dictionary else {}
+
+
+func parameter_types(callee:String, line:int, column:int = -1) -> Array:
+	var data := _function_arguments(callee, line, column)
+	if data.is_empty():
+		return []
+	var result:Array = []
+	for argument:Dictionary in data.args.values():
+		var type:String = argument.get(&"type", "").trim_suffix(_ins)
+		var resolved:String = data.parser.resolve_expression_to_type(type, data.line).trim_suffix(_ins) if type != "" else ""
+		result.append(resolved.get_slice(_type_delim, 1) if resolved.contains(_type_delim) else resolved)
+	return result
+
+
 ## has_static_type per parameter of `callee`, or null when the parser cannot find it.
 func params(callee:String, line:int, _column:int = -1) -> Variant:
-	var args = parser.get_function_data(callee, line).get(&"func_args")
+	var args:Variant = _function_arguments(callee, line).get("args")
 	if not args is Dictionary or args.is_empty():
 		return null
 	return _static_flags(args)

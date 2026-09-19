@@ -9,6 +9,7 @@ const InlinePass = preload("res://addons/addon_lib/gdscript_optimizer/passes/inl
 
 var errors:Array = []
 var warnings:Array = []
+var stats:Dictionary = {}
 var _passes:Array = []
 var _files:Dictionary = {}
 
@@ -16,8 +17,13 @@ var _files:Dictionary = {}
 func prepare(sources:Dictionary, context:Context, pass_scripts:Array = [StructPass]) -> Dictionary:
 	errors = []
 	warnings = []
+	stats = {}
 	_passes = []
 	_files = {}
+	if context.struct_mode not in Config.MODES or context.inline_mode not in Config.MODES:
+		errors.append("Optimizer modes must be auto, tagged, or off.")
+		return {"errors": errors, "warnings": []}
+	pass_scripts = pass_scripts.filter(func(pass_script): return not ((pass_script == StructPass and context.struct_mode == "off") or (pass_script == InlinePass and context.inline_mode == "off")))
 	context.reset()
 	var snapshots:Dictionary = {}
 	if InlinePass in pass_scripts:
@@ -31,6 +37,7 @@ func prepare(sources:Dictionary, context:Context, pass_scripts:Array = [StructPa
 		var result:Dictionary = instance.prepare(sources, context)
 		errors.append_array(result.errors)
 		warnings.append_array(result.warnings)
+		stats.merge(result.get("stats", {}))
 		_passes.append(instance)
 		for key:String in instance.plans:
 			_files[key] = true

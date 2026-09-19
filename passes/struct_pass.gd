@@ -14,6 +14,8 @@ var _parser_cache:Dictionary = {}
 var _warnings:Array = []
 var _context
 var _source_keys:Dictionary = {}
+var _discovery:Dictionary = {}
+var _types_cache:Dictionary = {}
 
 
 func prepare(sources:Dictionary, context) -> Dictionary:
@@ -25,8 +27,11 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 	_source_keys.clear()
 	for key:String in sources:
 		_source_keys[sources[key]] = key
-	var registry = TagRegistry.new()
+	_types_cache.clear()
+	_discovery = {"struct_candidates": 0, "struct_eligible": 0, "struct_candidates_skipped": 0}
 	var errors:Array = []
+	if context.struct_mode == "off":
+		return {"errors": [], "warnings": [], "stats": _discovery}
 	for key:String in sources:
 		var source:String = sources[key]
 		if source.get_extension() != "gd":
@@ -34,38 +39,131 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 		if not FileAccess.file_exists(source):
 			errors.append("%s: source file does not exist" % source)
 			continue
-		for entry:Dictionary in registry.get_file_entries(source):
-			if entry.tag != "struct":
+		var lines := FileAccess.get_file_as_string(source).split("\n")
+		var tags:Array = TagRegistry.scan_lines(lines, source).filter(func(entry): return entry.tag == "struct")
+		if context.struct_mode != "auto" and tags.is_empty():
+			continue
+		var entries:Dictionary = {}
+		var excluded:Dictionary = {}
+		var types = _types(source)
+		if types.error != "":
+			errors.append(types.error)
+			continue
+		if context.struct_mode == "auto":
+			for access:String in types.parser.get_classes():
+				var owner = types.parser.get_class_object(access)
+				var identity:String = owner.get_script_class_path()
+				entries[identity] = {"identity": identity, "target": maxi(0, owner.declaration_line),
+					"attach": TagRegistry.ATTACH_FILE if identity == source else TagRegistry.ATTACH_MEMBER,
+					"explicit": false}
+		for entry:Dictionary in tags:
+			var valid_attachment:bool = entry.attach == TagRegistry.ATTACH_FILE or (entry.attach == TagRegistry.ATTACH_MEMBER and entry.target_kind == "class")
+			var options:Dictionary = TagRegistry.Options.parse(entry.args)
+			if not valid_attachment or not entry.mods.is_empty() or not options.errors.is_empty() or (not options.options.is_empty() and options.options != {"off": true}):
+				errors.append("%s:%d: invalid struct tag; use #! struct or #! struct; off above a class" % [source, entry.line + 1])
 				continue
-			var valid_attachment:bool = entry.attach == TagRegistry.ATTACH_FILE or \
-				(entry.attach == TagRegistry.ATTACH_MEMBER and entry.target_kind == "class")
-			if not valid_attachment:
-				errors.append("%s:%d: put #! struct on its own line above a class" % [source, entry.line + 1])
+			if options.options.has("off"):
+				excluded[entry.identity] = true
 				continue
-			var lines = FileAccess.get_file_as_string(source).split("\n")
-			var def = StructRewrite.parse_def(lines, entry.target, entry.attach == TagRegistry.ATTACH_FILE, entry.identity)
-			for err in def.errors:
-				errors.append("%s %s" % [source, err])
+			entry.explicit = true
+			entries[entry.identity] = entry
+		for identity:String in excluded:
+			entries.erase(identity)
+		for entry:Dictionary in entries.values():
+			_discovery.struct_candidates += 1
+			var def := StructRewrite.parse_def(lines, entry.target, entry.attach == TagRegistry.ATTACH_FILE, entry.identity)
+			if not def.errors.is_empty():
+				if entry.explicit:
+					for err:String in def.errors:
+						errors.append("%s %s" % [source, err])
+				continue
 			def.file = source
 			def.key = key
+			def.explicit = entry.explicit
+			if not context.aggressive and not _value_fields(def, types.parser):
+				if entry.explicit:
+					_warnings.append("%s: struct %s requires aggressive for reference, Variant, or unresolved fields" % [source, entry.identity])
+				continue
 			structs[entry.identity] = def
-	if not errors.is_empty() or structs.is_empty():
-		return {"errors": errors, "warnings": _warnings}
+	if errors.is_empty():
+		_validate_auto(sources)
+	if errors.is_empty() and not structs.is_empty():
+		var reach = _struct_reach(sources.values())
+		for key:String in sources:
+			var source:String = sources[key]
+			if source.get_extension() != "gd":
+				continue
+			var plan = _plan_file(source, reach.has(source), errors)
+			if not plan.is_empty():
+				plans[key] = plan
+	_release_parsers()
+	_discovery.struct_eligible = structs.size()
+	_discovery.struct_candidates_skipped = _discovery.struct_candidates - structs.size()
+	return {"errors": errors, "warnings": _warnings, "stats": _discovery}
 
-	var reach = _struct_reach(sources.values())
-	for key:String in sources:
-		var source:String = sources[key]
-		if source.get_extension() != "gd":
-			continue
-		var plan = _plan_file(source, reach.has(source), errors)
-		if not plan.is_empty():
-			plans[key] = plan
-	return {"errors": errors, "warnings": _warnings}
+
+func _release_parsers() -> void:
+	var parsers:Array = _types_cache.values().map(func(types): return types.parser)
+	for data:Dictionary in _parser_cache.get(_context.parser_script.Keys.CACHE_ACTIVE_PARSERS, {}).values():
+		parsers.append(data.get(_context.parser_script.Keys.CACHE_PARSER))
+	for parser in parsers:
+		if is_instance_valid(parser):
+			parser.active_parser = null
+			if is_instance_valid(parser.code_edit):
+				parser.code_edit.free()
+	_parser_cache.clear()
+	_types_cache.clear()
+
+
+func _types(source:String):
+	if not _types_cache.has(source):
+		_types_cache[source] = StructTypes.new(_context.parser_script, source, structs, _parser_cache)
+	return _types_cache[source]
+
+
+func _value_fields(def:Dictionary, parser) -> bool:
+	for field:Dictionary in def.fields:
+		var declaration:Variant = parser.Utils.get_var_or_const_info(parser.code_edit.get_line(field.line).strip_edges())
+		if declaration == null or (field.type == "" and not declaration[3]):
+			return false
+		var owner = parser.get_class_object(parser.get_class_at_line(field.line))
+		var type:String = owner.get_member_type(field.name).trim_suffix(parser.Keys.INS_DELIM)
+		if type not in StructOptimize.ValueTypes.VALUES:
+			return false
+	return true
+
+
+func _validate_auto(sources:Dictionary) -> void:
+	# Remove complete candidates before planning edits; repeat after dependent types change.
+	while structs.values().any(func(def): return not def.explicit):
+		var rejected:Dictionary = {}
+		var reach := _struct_reach(sources.values())
+		for source:String in sources.values():
+			if source.get_extension() != "gd" or not reach.has(source):
+				continue
+			var types = _types(source)
+			for access:String in types.parser.get_classes():
+				var owner = types.parser.get_class_object(access)
+				for inherited:String in owner.get_inherited_scripts():
+					if structs.has(inherited) and not structs[inherited].explicit:
+						rejected[inherited] = true
+			var lines := FileAccess.get_file_as_string(source).split("\n")
+			var flow := StructRewrite.check_flow(lines, types.lookups(), structs, true)
+			for identity:String in flow.rejected:
+				if structs.has(identity) and not structs[identity].explicit:
+					rejected[identity] = true
+		if rejected.is_empty():
+			break
+		for identity:String in rejected:
+			structs.erase(identity)
+
 
 
 ## Field access and the flow check first, on the source text the parser sees; then phase-1 sites on
 ## that result, while line indexes still match; then each struct body here, bottom first.
 func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
+	if not reachable and not structs.values().any(func(def): return def.file == source):
+		return {}
 	var lines = FileAccess.get_file_as_string(source).split("\n")
 	var owners = []
 	TagRegistry.scan_lines(lines, source, owners)
@@ -87,7 +185,7 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 	var optimization
 	if reachable:
 		StructRewrite.rewrite_lines(lines, resolve, structs) # only fills `names`
-		var types = StructTypes.new(_context.parser_script, source, structs, _parser_cache)
+		var types = _types(source)
 		if types.error != "":
 			errors.append(types.error)
 			return {}
@@ -100,8 +198,7 @@ func _plan_file(source:String, reachable:bool, errors:Array) -> Dictionary:
 			if not names.has(path):
 				names[path] = _injection(path, lines, injected)
 			return names[path]
-		if _context.scalar_replacement or _context.struct_read_types != 0:
-			optimization = StructOptimize.new(lines, types, _context)
+		optimization = StructOptimize.new(lines, types, _context)
 		var access = StructRewrite.rewrite_access(lines, types.type_of, structs, name_for, types.annotation, optimization)
 		ops = access.ops
 		sites = access.lines

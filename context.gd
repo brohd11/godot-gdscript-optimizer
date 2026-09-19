@@ -4,7 +4,7 @@ extends RefCounted
 
 const UtilsRemote = preload("res://addons/addon_lib/gdscript_optimizer/utils_remote.gd")
 
-enum StructReadTypes { OFF, TYPED_LOCALS, AS_CASTS }
+const Config = preload("res://addons/addon_lib/gdscript_optimizer/config.gd")
 
 var parser_script:GDScript = preload("res://addons/addon_lib/gdscript_parser/gdscript_parser.gd") #! resolve GDScriptParser
 var class_list:Dictionary = {}
@@ -15,15 +15,22 @@ var scan_references:Callable
 var injection_header:String = "### GDScript Optimizer Structs"
 var source_snapshots:Dictionary = {}
 var debug_tags:bool = false
-var scalar_replacement:bool = false
-var scalar_replacement_allow_ref_counted:bool = false
-var struct_read_types_allow_ref_counted:bool = false
-var inline_functions_allow_ref_counted:bool = false
-var inline_functions_allow_variants:bool = false
-var struct_read_types:StructReadTypes = StructReadTypes.OFF
+var struct_mode:String = "tagged"
+var inline_mode:String = "tagged"
+var aggressive:bool = false
 
 var _scanner
 var _references:Dictionary = {}
+
+
+func configure(options:Dictionary) -> Array:
+	var result := Config.from_dictionary(options)
+	if result.errors.is_empty():
+		struct_mode = result.options.struct_mode
+		inline_mode = result.options.inline_mode
+		aggressive = result.options.aggressive
+		debug_tags = result.options.debug_tags
+	return result.errors
 
 
 func set_global_classes(classes:Dictionary) -> void:

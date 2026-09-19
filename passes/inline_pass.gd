@@ -16,6 +16,8 @@ var _context
 var _catalog:Dictionary = {}
 var _building:Array = []
 var _definition_errors:Dictionary = {}
+var _discovery:Dictionary = {}
+var _definition_parsers:Dictionary = {}
 const MAX_DEPTH = 16
 const MAX_TOKENS = 4096
 
@@ -32,6 +34,10 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 	_snapshots = context.source_snapshots.duplicate()
 	var errors:Array = []
 	var warnings:Array = []
+	_definition_parsers.clear()
+	_discovery = {"inline_candidates": 0, "inline_eligible": 0, "inline_definitions_skipped": 0}
+	if context.inline_mode == "off":
+		return {"errors": [], "warnings": [], "stats": _discovery}
 	for key:String in sources:
 		var path:String = sources[key]
 		if path.get_extension() != "gd":
@@ -41,22 +47,53 @@ func prepare(sources:Dictionary, context) -> Dictionary:
 			continue
 		var lines:PackedStringArray = _snapshots.get(path, FileAccess.get_file_as_string(path)).split("\n")
 		var tags:Array = Registry.scan_lines(lines, path).filter(func(entry): return entry.tag == "inline")
-		if tags.is_empty():
-			continue
+		var entries:Dictionary = {}
+		var excluded:Dictionary = {}
+		if context.inline_mode == "auto":
+			var parser = _parser(path, "\n".join(lines))
+			if parser == null:
+				errors.append("%s: could not parse inline candidates" % path)
+				continue
+			for function in parser.get_class_object().functions.values():
+				var identity:String = path + Registry.MEMBER_DELIM + function.name
+				entries[identity] = {"identity": identity, "file": path, "owner_class": path,
+					"attach": Registry.ATTACH_MEMBER, "target_kind": "func", "target_name": function.name,
+					"line": function.declaration_line, "target": function.declaration_line,
+					"mods": "", "args": "", "explicit": false}
+			_definition_parsers[path] = parser
 		for tag:Dictionary in tags:
+			tag.explicit = true
+			var options:Dictionary = Registry.Options.parse(tag.args)
+			if options.options.has("off"):
+				excluded[tag.identity] = true
+				if not tag.mods.is_empty() or not options.errors.is_empty() or options.options != {"off": true}:
+					warnings.append("%s:%d: invalid inline exclusion" % [path, tag.line + 1])
+				continue
+			entries[tag.identity] = tag
 			_tagged[tag.identity] = true
+		for identity:String in excluded:
+			entries.erase(identity)
+		for tag:Dictionary in entries.values():
 			_catalog[tag.identity] = tag
 			_names[tag.target_name] = true
 	for identity:String in _catalog:
 		_build_definition(identity)
+	for parser in _definition_parsers.values():
+		if parser != null:
+			_dispose(parser)
+	_definition_parsers.clear()
 	for identity:String in _definition_errors:
 		var tag:Dictionary = _catalog[identity]
-		warnings.append("%s:%d: #! inline skipped: %s" % [tag.file, tag.line + 1, _definition_errors[identity]])
+		if tag.explicit:
+			warnings.append("%s:%d: #! inline skipped: %s" % [tag.file, tag.line + 1, _definition_errors[identity]])
 	if not _definitions.is_empty():
 		for key:String in sources:
 			if sources[key].get_extension() == "gd":
 				plans[key] = sources[key]
-	return {"errors": errors, "warnings": warnings}
+	_discovery.inline_candidates = _catalog.size()
+	_discovery.inline_eligible = _definitions.size()
+	_discovery.inline_definitions_skipped = _catalog.size() - _definitions.size()
+	return {"errors": errors, "warnings": warnings, "stats": _discovery}
 
 
 func _build_definition(identity:String) -> Dictionary:
@@ -71,14 +108,15 @@ func _build_definition(identity:String) -> Dictionary:
 		return {}
 	var tag:Dictionary = _catalog[identity]
 	var source:String = _snapshots.get(tag.file, FileAccess.get_file_as_string(tag.file))
-	var parser = _parser(tag.file, source)
+	if not _definition_parsers.has(tag.file):
+		_definition_parsers[tag.file] = _parser(tag.file, source)
+	var parser = _definition_parsers[tag.file]
 	if parser == null:
 		_definition_errors[identity] = "could not parse inline definition"
 		return {}
 	_building.append(identity)
 	var definition := _definition(tag, source.split("\n"), parser)
 	_building.pop_back()
-	_dispose(parser)
 	if definition.has("error") or _definition_errors.has(identity):
 		_definition_errors[identity] = definition.get("error", _definition_errors.get(identity, "unsupported definition"))
 		return {}
@@ -98,6 +136,7 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 	var function = parser.get_class_object().functions.get(tag.target_name)
 	if function == null or not function.is_static():
 		return {"error": "only static functions are supported"}
+	var force:bool = _context.aggressive or options.options.has("substitute")
 	var params:Dictionary = {}
 	var defaults:Dictionary = {}
 	for name:String in function.get_arguments():
@@ -105,8 +144,10 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 		var type := Body.TypeInfo.normalize(argument.type, parser, function.declaration_line)
 		if type == "" or not argument.has_static_type:
 			type = "Variant"
-		if not _direct_type(type) and (not Body.TypeInfo.supported(type, parser) or not argument.has_static_type):
+		if not _direct_type(type, force) and (not Body.TypeInfo.supported(type, parser, force) or not argument.has_static_type):
 			return {"error": "parameters must have supported explicit types"}
+		if not force and type not in Body.TYPES:
+			return {"error": "reference and Variant parameters require aggressive or substitute"}
 		params[name] = type
 		if argument.assignment != "":
 			defaults[name] = _default(parser, argument.assignment, function.declaration_line)
@@ -115,8 +156,10 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 	var return_type := "void" if raw_return == "void" else Body.TypeInfo.normalize(raw_return, parser, function.declaration_line)
 	if return_type == "":
 		return_type = "Variant"
-	if return_type != "void" and not Body.TypeInfo.supported(return_type, parser) and not _direct_type(return_type):
+	if return_type != "void" and not Body.TypeInfo.supported(return_type, parser) and not _direct_type(return_type, force):
 		return {"error": "a supported explicit return type is required"}
+	if not force and return_type != "void" and return_type not in Body.TYPES:
+		return {"error": "reference and Variant returns require aggressive or substitute"}
 	var statements:Array = []
 	var state := {"quote": "", "depth": 0, "cont": false}
 	var base_indent := -1
@@ -148,21 +191,22 @@ func _definition(tag:Dictionary, lines:PackedStringArray, parser) -> Dictionary:
 			return {"error": rewritten.reason}
 		logical = rewritten.text
 		nested = rewritten.events
-		var analyzed := _expression(logical, params, parser, statements[0].line)
-		if analyzed.error == "" and _direct_return(analyzed.type, return_type):
-			direct = {"expression": logical}
+	if logical != "":
+		var analyzed := _expression(logical, params, parser, statements[0].line, -1, force)
+		if analyzed.error == "" and _direct_return(analyzed.type, return_type, force):
+			direct = {"expression": logical, "globals": analyzed.globals, "effectful": analyzed.effectful}
 	var reduction := _reduction(statements, rest, return_type)
-	var assessed := Body.assess(parser, normalized, params, return_type)
-	var template_eligible:bool = not assessed.has("error") and (return_type == "void" or Body.TypeInfo.supported(return_type, parser))
+	var assessed := Body.assess(parser, normalized, params, return_type, force)
+	var template_eligible:bool = not assessed.has("error") and (return_type == "void" or Body.TypeInfo.supported(return_type, parser, force))
 	for type:String in params.values():
-		template_eligible = template_eligible and Body.TypeInfo.supported(type, parser)
+		template_eligible = template_eligible and Body.TypeInfo.supported(type, parser, force)
 	if not template_eligible:
 		if direct.is_empty() and reduction == "":
 			return assessed if assessed.has("error") else {"error": "unsupported template signature or direct expression"}
 		assessed = {}
 	assessed.merge({"identity": tag.identity, "file": tag.file, "params": params, "defaults": defaults, "rest": rest,
 		"return_type": return_type, "direct": direct, "template_eligible": template_eligible,
-		"substitute": options.options.has("substitute"), "reduction": reduction, "nested": nested,
+		"substitute": force, "explicit_substitute": options.options.has("substitute"), "explicit": tag.explicit, "reduction": reduction, "nested": nested,
 		"indent_width": base_indent})
 	return assessed
 
@@ -183,17 +227,17 @@ func _reduction(statements:Array, rest:String, return_type:String) -> String:
 	return ""
 
 
-func _direct_type(type:String) -> bool:
-	return DirectExpression.admitted(type, _context.inline_functions_allow_ref_counted, _context.inline_functions_allow_variants)
+func _direct_type(type:String, force:bool = false) -> bool:
+	return DirectExpression.admitted(type, force or _context.aggressive, force or _context.aggressive)
 
 
-func _direct_return(actual:String, expected:String) -> bool:
-	return actual == expected or (_context.inline_functions_allow_variants and "Variant" in [actual, expected])
+func _direct_return(actual:String, expected:String, force:bool = false) -> bool:
+	return force or actual == expected or (_context.aggressive and "Variant" in [actual, expected])
 
 
-func _expression(source:String, params:Dictionary, parser, line:int, column:int = -1) -> Dictionary:
+func _expression(source:String, params:Dictionary, parser, line:int, column:int = -1, force:bool = false, globals:Dictionary = {}) -> Dictionary:
 	return DirectExpression.new().analyze(source, params, parser, line, column,
-		_context.inline_functions_allow_ref_counted, _context.inline_functions_allow_variants)
+		force or _context.aggressive, force or _context.aggressive, globals)
 
 
 func _single_return(statements:Array, parser, lines:PackedStringArray) -> String:
@@ -241,6 +285,8 @@ func _default(parser, expression:String, line:int) -> Dictionary:
 		return data
 	for name:String in metadata.globals:
 		var global:Dictionary = metadata.globals[name]
+		if global.get("effectful", false):
+			return data
 		if not global.is_empty() and Body.type_of(parser, name, line) not in Body.TYPES:
 			var raw:String = parser.resolve_expression_to_type(name, line)
 			if not raw.ends_with(".gd"):
@@ -273,7 +319,8 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 		var replacement := _expand(site, parser, path, source)
 		if replacement.is_empty():
 			result.stats.inline_skipped += 1
-			result.warnings.append("%s:%d: inline candidate %s left unchanged (%s)" % [path, site.line + 1, site.callee, site.get("reason", "unsupported or unresolved call")])
+			if _context.inline_mode != "auto":
+				result.warnings.append("%s:%d: inline candidate %s left unchanged (%s)" % [path, site.line + 1, site.callee, site.get("reason", "unsupported or unresolved call")])
 		else:
 			replacement.origin = "%s:%d" % [path, site.line + 1]
 			edits.append(replacement)
@@ -341,6 +388,13 @@ func _resolve_call(site:Dictionary, parser, path:String, inside:bool = false) ->
 	var fixed:int = definition.params.size() - int(definition.rest != "")
 	if supplied.size() > fixed and definition.rest == "":
 		return {}
+	if definition.substitute and not definition.explicit_substitute:
+		var types := _local_types({"locals": locals, "function": function}, parser, site)
+		for argument:String in supplied:
+			var expression := argument.strip_edges()
+			if not types.has(expression) and not _pure(expression, types, parser, site.line, site.column):
+				site.reason = "unproven argument requires explicit inline; substitute"
+				return {}
 	var args:Array = supplied.slice(0, fixed)
 	var default_indices:Array = []
 	for name:String in definition.params.keys().slice(args.size(), fixed):
@@ -426,7 +480,8 @@ func _local_types(call:Dictionary, parser, site:Dictionary) -> Dictionary:
 
 
 func _pure(source:String, types:Dictionary, parser, line:int, column:int) -> bool:
-	if _expression(source, types, parser, line, column).error != "":
+	var analyzed := _expression(source, types, parser, line, column)
+	if analyzed.error != "" or analyzed.effectful:
 		return false
 	var tokens:Array = parser.CodeEditParser.LambdaScanner._tokens(source)
 	for token:Dictionary in tokens:
@@ -446,7 +501,7 @@ func _argument(source:String, site:Dictionary, parser, call:Dictionary, path:Str
 		return {}
 	var types := _local_types(call, parser, site)
 	var text:String = rewritten.text.strip_edges()
-	var checked := _expression(text, types, parser, site.line, site.column)
+	var checked := _expression(text, types, parser, site.line, site.column, call.definition.substitute)
 	var type:String = checked.type if checked.error == "" else Body.type_of(parser, source, site.line, site.column)
 	if types.has(text):
 		type = types[text]
@@ -457,7 +512,7 @@ func _argument(source:String, site:Dictionary, parser, call:Dictionary, path:Str
 
 
 func _event(definition:Dictionary, depth:int, mode:String = "direct") -> Dictionary:
-	return {"callee": definition.identity, "mode": mode, "args": "substitute" if definition.substitute else "",
+	return {"callee": definition.identity, "mode": mode, "args": "substitute" if definition.explicit_substitute else ("aggressive" if definition.substitute else ""),
 		"depth": depth}
 
 
@@ -466,7 +521,7 @@ func _direct_node(site:Dictionary, parser, call:Dictionary, path:String, inside:
 	if depth >= MAX_DEPTH:
 		site.merge({"fatal": true, "reason": "inline depth limit"}, true)
 		return {}
-	if not call.default_indices.is_empty() or (definition.direct.is_empty() and definition.reduction == ""):
+	if definition.direct.is_empty() and definition.reduction == "":
 		return {}
 	var bindings:Dictionary = {}
 	var types:Dictionary = {}
@@ -478,13 +533,30 @@ func _direct_node(site:Dictionary, parser, call:Dictionary, path:String, inside:
 	if definition.reduction == "" and definition.rest != "":
 		return {}
 	var logical:String = definition.direct.get("expression", "")
+	var globals:Dictionary = definition.direct.get("globals", {})
+	var aliases := {"prefix": "_inline_%d_" % site.start}
+	var visible := _visible_types(site, parser, call)
+	var external_bindings:Dictionary = {}
+	for name:String in globals:
+		external_bindings[name] = _bind_global(globals[name], site, parser, call, aliases, visible)
 	var placeholders:Array = []
 	for i in args.size():
-		var node := _argument(args[i], site, parser, call, path, inside, depth)
+		var node:Dictionary
+		if i in call.default_indices:
+			var value:Dictionary = definition.defaults[definition.params.keys()[i]]
+			var default_bindings:Dictionary = {}
+			for name:String in value.globals:
+				if not value.globals[name].is_empty():
+					default_bindings[name] = _bind_global(value.globals[name], site, parser, call, aliases, visible)
+				elif call.locals.has(name) or parser.get_class_object(parser.get_class_at_line(site.line)).get_member_data(name, true) != null:
+					return {}
+			node = {"text": Body.rename(parser, value.expression, default_bindings), "type": value.type, "pure": true, "events": []}
+		else:
+			node = _argument(args[i], site, parser, call, path, inside, depth)
 		if node.is_empty() or (not definition.substitute and not node.pure):
 			return {}
 		var expected:String = "bool" if definition.reduction != "" else definition.params.values()[i]
-		if not _direct_type(node.type) or not _direct_type(expected) or not _direct_return(node.type, expected):
+		if not _direct_type(node.type, definition.substitute) or not _direct_type(expected, definition.substitute) or not _direct_return(node.type, expected, definition.substitute):
 			return {}
 		var placeholder := "_optimizer_argument_%d" % i
 		while logical.contains(placeholder) or bindings.has(placeholder):
@@ -506,20 +578,27 @@ func _direct_node(site:Dictionary, parser, call:Dictionary, path:String, inside:
 	for i in nodes.size():
 		if placeholders[i] in slots_used:
 			events.append_array(nodes[i].events)
-	var checked := _expression(logical, types, parser, site.line, site.column)
-	if checked.error != "" or not _direct_return(checked.type, definition.return_type):
+	var checked := _expression(logical, types, parser, site.line, site.column, definition.substitute, globals)
+	if checked.error != "" or not _direct_return(checked.type, definition.return_type, definition.substitute):
 		return {}
 	var constants:Dictionary = {}
 	for i in nodes.size():
 		if nodes[i].text.is_valid_int() or nodes[i].text.is_valid_float():
 			constants[placeholders[i]] = "(" + nodes[i].text + ")"
-	if _expression(Body.rename(parser, logical, constants), types, parser, site.line, site.column).error == "constant zero divisor":
+	var literal_check := _expression(Body.rename(parser, logical, constants), types, parser, site.line, site.column, definition.substitute, globals)
+	if literal_check.error in ["constant zero divisor", "constant divisor requires capture"]:
+		site.reason = literal_check.error
 		return {}
+	if aliases.size() > 1:
+		return {}
+	# Rename external roots before substituting caller expressions, whose names belong to the caller.
+	logical = Body.rename(parser, logical, external_bindings)
 	var text := "(" + Body.rename(parser, logical, bindings) + ")"
 	# Recheck literal arithmetic so substitution cannot introduce a compile-time zero divisor.
 	var locals := _local_types(call, parser, site)
-	var concrete := _expression(text, locals, parser, site.line, site.column)
-	if concrete.error == "constant zero divisor":
+	var concrete := _expression(text, locals, parser, site.line, site.column, definition.substitute)
+	if concrete.error in ["constant zero divisor", "constant divisor requires capture"]:
+		site.reason = concrete.error
 		return {}
 	for nested:Dictionary in definition.nested:
 		var child := nested.duplicate()
@@ -543,6 +622,9 @@ func _expand(site:Dictionary, parser, path:String, source:String) -> Dictionary:
 	if not direct.is_empty():
 		return {"start": site.start, "end": site.end, "text": direct.text, "events": direct.events, "mode": "direct", "stats": {"inline_substituted_args": call.explicit_count}}
 	if site.get("fatal", false):
+		return {}
+	# Unchecked templates would substitute the same divisor and can introduce a parse error.
+	if call.definition.substitute and site.get("reason", "") in ["constant zero divisor", "constant divisor requires capture"]:
 		return {}
 	if not call.definition.template_eligible:
 		return {}
@@ -600,10 +682,13 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 	var is_void:bool = definition.return_type == "void"
 	var early_returns:bool = definition.early_returns
 	var aliases := {"prefix": unique}
+	var visible := _visible_types(site, parser, call)
 	var bindings:Dictionary = {}
 	var captures:Array = []
+	var owned_temporaries:bool = false
 	var rest_bindings:Dictionary = {}
 	if definition.rest != "":
+		owned_temporaries = true
 		var raw_names:Array = []
 		for i in call.supplied.size():
 			var raw := unique + "supplied_%d" % i
@@ -622,7 +707,7 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 				site.reason = "built-in name is shadowed: " + name
 				return {}
 		else:
-			bindings[name] = _global(global, parser, aliases)
+			bindings[name] = _bind_global(global, site, parser, call, aliases, visible)
 	var names:Array = definition.params.keys()
 	for i in call.args.size():
 		var name:String = names[i]
@@ -634,7 +719,7 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 			for key:String in definition.defaults[name].globals:
 				var global:Dictionary = definition.defaults[name].globals[key]
 				if not global.is_empty():
-					globals[key] = _global(global, parser, aliases)
+					globals[key] = _bind_global(global, site, parser, call, aliases, visible)
 				elif call.locals.has(key) or caller.get_member_data(key, true) != null:
 					site.reason = "default built-in name is shadowed: " + key
 					return {}
@@ -655,14 +740,14 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 		var stable := false
 		if not is_default and argument.is_valid_ascii_identifier() and call.locals.has(argument):
 			stable = _local_data(call, argument).get("has_static_type", false)
-			if not stable:
+			if not stable and not definition.substitute:
 				site.reason = "Variant local argument is unsupported; use a typed local or indexed lookup"
 				return {}
 		elif argument.is_valid_int() or argument.is_valid_float() or argument in ["true", "false", "null"]:
 			stable = true
 		elif tokens.size() == 1 and tokens[0].text == "string" and argument.begins_with('"'):
 			stable = true
-		if not Body.compatible(actual, expected):
+		if not definition.substitute and not Body.compatible(actual, expected):
 			if not (actual in ["", "Variant", "null"] or lookup or Body.TypeInfo.is_reference(expected)):
 				site.reason = "incompatible argument type for " + name
 				return {}
@@ -674,9 +759,14 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 		# Object properties may have accessors; keep the original strong parameter reference.
 		if expected.contains(".gd") or expected == "RefCounted":
 			captured = true
+		if definition.substitute:
+			# Written value parameters still need storage; caller variables must not be rebound.
+			captured = definition.rest != "" or usage.rebound or (usage.written and not DirectExpression.reference_type(expected))
 		if captured:
 			bindings[name] = unique + name
-			captures.append("var %s:%s = %s" % [bindings[name], Body.TypeInfo.emit(expected, parser, aliases), rest_bindings.get(i, argument)])
+			var annotation:String = "" if definition.substitute else ":" + Body.TypeInfo.emit(expected, parser, aliases, visible)
+			captures.append("var %s%s = %s" % [bindings[name], annotation, rest_bindings.get(i, argument)])
+			owned_temporaries = owned_temporaries or _owns_reference(actual if definition.substitute else expected)
 			stats.inline_captured_args += 1
 			if lookup and usage.count > 1:
 				stats.inline_repeated_access_captures += 1
@@ -686,6 +776,9 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 	for name:String in definition.symbols:
 		if not definition.params.has(name):
 			bindings[name] = unique + name
+			owned_temporaries = owned_temporaries or _owns_reference(definition.symbols[name])
+	if definition.substitute:
+		owned_temporaries = false
 	var result_name := unique + "result"
 	while bindings.values().has(result_name):
 		result_name += "_"
@@ -695,7 +788,41 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 	var loop_name := unique + "once"
 	while bindings.values().has(loop_name) or loop_name in [result_name, bridge]:
 		loop_name += "_"
-	var return_type := Body.TypeInfo.emit(definition.return_type, parser, aliases)
+	var target:String = ""
+	var target_type:String = "Variant"
+	var target_declaration:String = ""
+	var assignment := RegEx.create_from_string(r"^([A-Za-z_][A-Za-z_0-9]*)\s*=$").search(prefix.strip_edges())
+	if not is_void and assignment != null and not owned_temporaries:
+		var candidate:String = assignment.get_string(1)
+		target_type = Body.type_of(parser, candidate, site.line, site.column) if _local_data(call, candidate).get("has_static_type", false) else "Variant"
+		if definition.substitute or (target_type == definition.return_type and not _owns_reference(target_type)):
+			target = candidate
+	if not is_void and not owned_temporaries and prefix.strip_edges().begins_with("var "):
+		var declaration:Variant = parser.Utils.get_var_or_const_info(prefix.strip_edges() + " null")
+		if declaration != null:
+			var candidate:String = declaration[0]
+			target_type = definition.return_type if declaration[3] else ("Variant" if declaration[1] == "" else Body.TypeInfo.normalize(declaration[1], parser, site.line))
+			var exact_returns:bool = definition.body.all(func(body): return not body["return"] or body.value_type == definition.return_type)
+			var preserves_type:bool = not _owns_reference(definition.return_type) and (target_type == definition.return_type or exact_returns)
+			# Declaring early must not shadow a name used by the initializer or imported body.
+			var reads:Array = captures + bindings.values()
+			for body:Dictionary in definition.body:
+				reads.append(Body.rename(parser, body.text, bindings, body.tokens))
+			var shadows:bool = reads.any(func(text): return parser.CodeEditParser.LambdaScanner._tokens(text).any(func(token): return token.text == candidate))
+			if not shadows and (definition.substitute or preserves_type):
+				target = candidate
+				target_declaration = "var " + target
+				if declaration[3]:
+					target_declaration += ":" + Body.TypeInfo.emit(definition.return_type, parser, aliases, visible)
+				elif declaration[1] != "":
+					target_declaration += ":" + declaration[1]
+	var tail_return:bool = prefix.strip_edges() == "return" and (definition.substitute or (not owned_temporaries and definition.body.all(func(body): return not body["return"] or body.value_type == definition.return_type)))
+	var mode:String = "void" if is_void else ("return" if tail_return else ("target" if target != "" else ("bridge" if _owns_reference(definition.return_type) and not definition.substitute else "slot")))
+	if mode == "bridge" and definition.body.any(func(body): return body.text.strip_edges().begins_with("if ")):
+		site.reason = "conditional expansion requires more than one result local"
+		return {}
+	var return_type:String = Body.TypeInfo.emit(definition.return_type, parser, aliases, visible) if mode in ["slot", "bridge"] else ""
+	var scoped:bool = mode != "return" and (mode == "bridge" or not captures.is_empty() or definition.symbols.size() > definition.params.size() or early_returns)
 	var indent := prefix.substr(0, prefix.length() - prefix.strip_edges(true, false).length())
 	var unit := "\t"
 	if indent.contains(" "):
@@ -717,7 +844,7 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 			annotation.compile(r"^((?:var|const)\s+[A-Za-z_][A-Za-z_0-9]*)\s*:\s*([^=]+)=")
 			var found := annotation.search(text.strip_edges())
 			if found != null:
-				text = text.replace(found.get_string(2), Body.TypeInfo.emit(body.type, parser, aliases) + " ")
+				text = text.replace(found.get_string(2), Body.TypeInfo.emit(body.type, parser, aliases, visible) + " ")
 				slots = []
 		text = Body.rename(parser, text, bindings, slots)
 		text = unit.repeat(body.indent / definition.indent_width) + text.strip_edges(true, false)
@@ -726,19 +853,30 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 			if is_void:
 				text = relative + "break"
 			else:
-				text = relative + result_name + " = " + text.strip_edges().trim_prefix("return ")
+				var expression:String = text.strip_edges().trim_prefix("return ")
+				if mode == "target" and definition.substitute:
+					var actual:String = Body.type_of(parser, expression, site.line, site.column)
+					if actual != "" and target_type != "Variant" and actual not in ["Variant", "null"] and not Body.compatible(actual, target_type):
+						site.reason = "substituted return is incompatible with assignment target"
+						return {}
+				text = relative + ("return " if mode == "return" else (target if mode == "target" else result_name) + " = ") + expression
 		rendered.append(text)
 	for path:String in aliases:
 		if path != "prefix":
 			lines.append(indent + 'const %s = preload("%s")' % [aliases[path], path])
-	if not is_void:
+	if target_declaration != "":
+		lines.append(indent + target_declaration)
+	if mode == "bridge":
 		lines.append(indent + "var " + bridge + ":Variant")
-	lines.append(indent + "if true:")
+	elif mode == "slot":
+		lines.append(indent + "var %s:%s" % [result_name, return_type])
+	if scoped:
+		lines.append(indent + "if true:")
+	var body_indent:String = indent + unit if scoped else indent
 	for capture:String in captures:
-		lines.append(indent + unit + capture)
-	if not is_void:
+		lines.append(body_indent + capture)
+	if mode == "bridge":
 		lines.append(indent + unit + "var %s:%s" % [result_name, return_type])
-	var body_indent := indent + unit
 	if early_returns:
 		lines.append(indent + unit + "for %s in 1:" % loop_name)
 		body_indent += unit
@@ -746,9 +884,11 @@ func _render_template(site:Dictionary, parser, call:Dictionary, unique:String, p
 	for text:String in rendered:
 		for line:String in text.split("\n"):
 			lines.append(body_indent + line)
-	if is_void:
+	if mode in ["void", "target", "return"]:
 		if not suffix.strip_edges().is_empty():
 			lines[0] += " " + suffix.strip_edges()
+	elif mode == "slot":
+		lines.append(prefix + result_name + suffix)
 	else:
 		lines.append(indent + unit + "%s = %s" % [bridge, result_name])
 		# The typed cast retains := inference; the bridge is cleared after the caller consumes it.
@@ -779,10 +919,43 @@ func _local_data(call:Dictionary, name:String) -> Dictionary:
 	return data
 
 
-func _global(global:Dictionary, parser, aliases:Dictionary) -> String:
+func _owns_reference(type:String) -> bool:
+	return type in ["", "Variant"] or DirectExpression.reference_type(type)
+
+
+func _visible_types(site:Dictionary, parser, call:Dictionary) -> Dictionary:
+	var caller = parser.get_class_object(parser.get_class_at_line(site.line))
+	var candidates:Array = caller.constants.keys() + caller.inner_classes.keys()
+	var visible:Dictionary = {}
+	for name:String in _context.class_list:
+		if call.locals.has(name) or caller.get_member_data(name, true) != null or _context.removed_globals.has(name):
+			continue
+		var path:String = _context.class_list[name]
+		if FileAccess.file_exists(path):
+			visible[path] = name
+	for name:String in candidates:
+		if call.locals.has(name) or caller.members.has(name):
+			continue
+		var type:String = Body.type_of(parser, name, site.line, site.column)
+		if type.contains(".gd") and not type.contains(parser.Keys.TYPE_DELIM):
+			visible[type] = name
+	return visible
+
+
+func _global(global:Dictionary, parser, aliases:Dictionary, visible:Dictionary = {}) -> String:
 	if global.has("type"):
-		return Body.TypeInfo.emit(global.type, parser, aliases)
-	return Body.TypeInfo.dependency(global.file, aliases) + "." + global.name
+		return Body.TypeInfo.emit(global.type, parser, aliases, visible)
+	return Body.TypeInfo.emit(global.file, parser, aliases, visible) + "." + global.name
+
+
+func _bind_global(global:Dictionary, site:Dictionary, parser, call:Dictionary, aliases:Dictionary, visible:Dictionary) -> String:
+	if global.has("file"):
+		var owner = parser.get_class_object(parser.get_class_at_line(site.line))
+		if owner.get_script_class_path() == global.file and not call.locals.has(global.name):
+			return global.name
+		if global.file == call.definition.file and site.callee.contains("."):
+			return site.callee.substr(0, site.callee.rfind(".")) + "." + global.name
+	return _global(global, parser, aliases, visible)
 
 
 func _parser(path:String, source:String):

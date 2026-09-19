@@ -24,14 +24,10 @@ options:
       replace_editor_interface: false
       optimizer:
         debug_tags: false
-        structs: true
-        inline_functions: true
-        scalar_replacement: true
-        struct_read_types: typed_locals
-        scalar_replacement_allow_ref_counted: false
-        struct_read_types_allow_ref_counted: false
-        inline_functions_allow_ref_counted: false
-        inline_functions_allow_variants: false
+        struct_mode: tagged
+        inline_mode: tagged
+        aggressive: false
+        debug_tags: false
         enabled: true
       class_rename_ignore: []
       backport_string_renames: {}

@@ -29,7 +29,7 @@ func analyze(source:String, parameters:Dictionary) -> Dictionary:
 	var result := _binary(0)
 	if _index != _tokens.size() or _tokens.is_empty():
 		_error = "unsupported arithmetic expression"
-	return {"error": _error, "type": result.type, "tokens": _tokens.duplicate()}
+	return {"error": _error, "type": result.type, "tokens": _tokens.duplicate(), "known": result.known, "value": result.value}
 
 
 static func render(tokens:Array, bindings:Dictionary) -> String:

@@ -521,11 +521,13 @@ const LITERAL_KEYWORDS = ["return", "in", "and", "or", "not", "else", "if", "eli
 ##   params(callee) / lambda_params(name) -> has_static_type per parameter, or null when unknown
 ##   lambda_body() -> whether the position is inside a lambda's body
 ## A statement spanning lines is checked as one; lambda body lines inside it are checked as their own.
-static func check_flow(lines:PackedStringArray, lookups:Dictionary, structs:Dictionary) -> Dictionary:
-	var ctx = {"lookups": lookups, "structs": structs, "errors": [], "warnings": []}
+static func check_flow(lines:PackedStringArray, lookups:Dictionary, structs:Dictionary, strict:bool = false) -> Dictionary:
+	var ctx = {"lookups": lookups, "structs": structs, "errors": [], "warnings": [], "strict": strict, "seen": {}, "rejected": {}}
 	var state = {"quote": "", "depth": 0, "cont": false}
 	var i = 0
 	while i < lines.size():
+		ctx.seen = {}
+		var previous_errors:int = ctx.errors.size() + ctx.warnings.size()
 		var parts = []
 		var positions:Array[Vector2i] = [] # joined-text offset -> (line, column)
 		while i < lines.size():
@@ -547,7 +549,74 @@ static func check_flow(lines:PackedStringArray, lookups:Dictionary, structs:Dict
 		_check_statement(raw_code.strip_edges(), lead, positions, ctx)
 		_check_literals(raw_code, positions, ctx)
 		_check_calls(raw_code, positions, ctx)
-	return {"errors": ctx.errors, "warnings": ctx.warnings}
+		if strict:
+			_check_identity_uses(raw_code, positions, ctx)
+			_check_nullable(raw_code, positions, ctx)
+			if RegEx.create_from_string(r"==|!=|\bin\b").search(raw_code) != null:
+				ctx.rejected.merge(ctx.seen)
+			for found in _rx("is").search_all(raw_code):
+				var identity := _raw(ctx, found.get_string("chain"), _at(positions, found.get_start()))
+				if structs.has(identity):
+					ctx.rejected[identity] = true
+		if ctx.errors.size() + ctx.warnings.size() > previous_errors:
+			ctx.rejected.merge(ctx.seen)
+	return {"errors": ctx.errors, "warnings": ctx.warnings, "rejected": ctx.rejected}
+
+
+static func _check_identity_uses(code:String, positions:Array[Vector2i], ctx:Dictionary) -> void:
+	var comparison := RegEx.create_from_string(r"([A-Za-z_][A-Za-z_0-9.]*)\s*(==|!=|\bin\b)\s*([A-Za-z_][A-Za-z_0-9.]*)")
+	var mask := _string_mask(code)
+	for found in comparison.search_all(code):
+		if mask[found.get_start()]:
+			continue
+		for group:int in [1, 3]:
+			var identity := _type(ctx, found.get_string(group), _at(positions, found.get_start(group)))
+			if identity != "":
+				ctx.rejected[identity] = true
+
+
+static func _check_nullable(code:String, positions:Array[Vector2i], ctx:Dictionary) -> void:
+	var nullable := RegEx.create_from_string(r"\b([A-Za-z_][A-Za-z_0-9.]*)\s*=\s*null\b")
+	var mask := _string_mask(code)
+	for found in nullable.search_all(code):
+		if mask[found.get_start()]:
+			continue
+		var identity := _raw(ctx, found.get_string(1), _at(positions, found.get_start(1)))
+		if ctx.structs.has(identity):
+			ctx.rejected[identity] = true
+	var uninitialized := RegEx.create_from_string(r"^\s*(?:static\s+)?var\s+\w+\s*:\s*([A-Za-z_][A-Za-z_0-9.]*)\s*$").search(code)
+	if uninitialized != null:
+		var identity := _raw(ctx, uninitialized.get_string(1), _at(positions, uninitialized.get_start(1)))
+		if ctx.structs.has(identity):
+			ctx.rejected[identity] = true
+	var class_value := RegEx.create_from_string(r"^\s*(?:var\s+\w+(?:\s*:[^=]*)?\s*:?=|[A-Za-z_][A-Za-z_0-9.]*\s*=|return)\s*(.+)$").search(code)
+	if class_value != null:
+		var expression:String = class_value.get_string(1)
+		var here := _at(positions, class_value.get_start(1))
+		var identity := _raw(ctx, expression, here)
+		if ctx.structs.has(identity) and _type(ctx, expression, here) == "":
+			ctx.rejected[identity] = true
+		var contained := _contained_structs(ctx, identity, here)
+		if not contained.is_empty():
+			var expected := ""
+			var declaration := RegEx.create_from_string(r"var\s+\w+\s*:\s*([^=]+)=").search(code)
+			var assignment := RegEx.create_from_string(r"^\s*([A-Za-z_][A-Za-z_0-9.]*)\s*=").search(code)
+			if code.strip_edges().begins_with("return "):
+				expected = _raw(ctx, ctx.lookups.return_raw.call(here.x, here.y), here)
+			elif declaration != null:
+				expected = _raw(ctx, declaration.get_string(1).strip_edges(), here)
+			elif code.substr(0, class_value.get_start(1)).contains(":="):
+				expected = identity
+			elif assignment != null:
+				expected = _raw(ctx, assignment.get_string(1), here)
+			if expected != identity:
+				ctx.rejected.merge(contained)
+	var stripped := code.strip_edges()
+	if stripped == "return null":
+		var here := _at(positions, code.find("return"))
+		var identity := _raw(ctx, ctx.lookups.return_raw.call(here.x, here.y), here)
+		if ctx.structs.has(identity):
+			ctx.rejected[identity] = true
 
 
 ## A continuation line that starts a statement in a lambda body: joined, its `var` or `return` would
@@ -572,11 +641,29 @@ static func _at(positions:Array[Vector2i], offset:int) -> Vector2i:
 
 
 static func _type(ctx:Dictionary, expr:String, pos:Vector2i) -> String:
-	return ctx.lookups.type_of.call(expr, pos.x, pos.y)
+	var type:String = ctx.lookups.type_of.call(expr, pos.x, pos.y)
+	if type != "":
+		ctx.seen[type] = true
+	return type
 
 
 static func _raw(ctx:Dictionary, expr:String, pos:Vector2i) -> String:
-	return ctx.lookups.raw_type.call(expr, pos.x, pos.y)
+	var type:String = ctx.lookups.raw_type.call(expr, pos.x, pos.y)
+	if ctx.structs.has(type):
+		ctx.seen[type] = true
+	if ctx.strict:
+		ctx.seen.merge(_contained_structs(ctx, type, pos))
+	return type
+
+
+static func _contained_structs(ctx:Dictionary, type:String, pos:Vector2i) -> Dictionary:
+	var result:Dictionary = {}
+	if type.contains("["):
+		for part:String in type.replace("[", ",").replace("]", ",").split(","):
+			var identity:String = ctx.lookups.raw_type.call(part.strip_edges(), pos.x, pos.y)
+			if ctx.structs.has(identity):
+				result[identity] = true
+	return result
 
 
 ## `code` is stripped and starts at offset `lead` of `positions`.
@@ -620,20 +707,42 @@ static func _check_calls(code:String, positions:Array[Vector2i], ctx:Dictionary)
 		var dot = callee.rfind(".")
 		var last = callee.substr(dot + 1)
 		var receiver = callee.substr(0, dot) if dot > -1 else ""
-		if receiver != "" and last in NAME_LOOKUPS and _type(ctx, receiver, here) != "":
+		if receiver != "" and (ctx.strict or last in NAME_LOOKUPS) and _type(ctx, receiver, here) != "":
 			ctx.errors.append(_err(here.x, "`%s` looks a struct up by name, which cannot work on an Array" % callee))
 			continue
 
 		var close = _find_close(code, mask, m.get_end() - 1)
 		var end = close if close != -1 else code.length()
 		var args = _split_args_at(code.substr(m.get_end(), end - m.get_end()))
+		if ctx.strict and close != -1 and RegEx.create_from_string(r"==|!=|\bin\b").search(code) != null:
+			_type(ctx, code.substr(m.get_start(), close - m.get_start() + 1), here)
 		if receiver != "" and ITERATORS.has(last) and not args.is_empty():
 			_check_iterator(callee, receiver, ITERATORS[last], args[0][0], _at(positions, m.get_end() + args[0][1]), here, ctx)
 
 		var param_types = null
+		var expected:Variant = null
 		for k in args.size():
 			var arg:String = args[k][0]
 			var arg_pos = _at(positions, m.get_end() + args[k][1])
+			if ctx.strict:
+				var raw := _raw(ctx, arg, arg_pos)
+				if ctx.structs.has(raw) and _type(ctx, arg, arg_pos) == "":
+					ctx.rejected[raw] = true
+				var contained := _contained_structs(ctx, raw, arg_pos)
+				if not contained.is_empty():
+					if expected == null:
+						expected = ctx.lookups.parameter_types.call(callee, here.x, here.y) if ctx.lookups.has("parameter_types") else []
+					if k >= expected.size() or expected[k] != raw:
+						ctx.rejected.merge(contained)
+			var actual := _type(ctx, arg, arg_pos)
+			if ctx.strict and (actual != "" or arg == "null"):
+				if expected == null:
+					expected = ctx.lookups.parameter_types.call(callee, here.x, here.y) if ctx.lookups.has("parameter_types") else []
+				if k < expected.size():
+					if arg == "null" and ctx.structs.has(expected[k]):
+						ctx.rejected[expected[k]] = true
+					if actual != "" and expected[k] != actual:
+						ctx.rejected[actual] = true
 			if arg == "" or _type(ctx, arg, arg_pos) == "":
 				continue
 			if callee == "is_instance_valid":
@@ -646,7 +755,9 @@ static func _check_calls(code:String, positions:Array[Vector2i], ctx:Dictionary)
 			else:
 				if param_types == null:
 					param_types = ctx.lookups.params.call(callee, here.x, here.y)
-				if param_types is Array and k < param_types.size() and not param_types[k]:
+				if ctx.strict and param_types == null:
+					ctx.errors.append(_err(arg_pos.x, "struct passed to an unresolved call"))
+				elif param_types is Array and k < param_types.size() and not param_types[k]:
 					ctx.errors.append(_err(arg_pos.x, "struct passed to untyped parameter %d of `%s`" % [k + 1, callee]))
 
 

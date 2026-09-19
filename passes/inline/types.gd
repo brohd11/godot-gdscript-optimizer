@@ -32,7 +32,9 @@ static func is_reference(type:String) -> bool:
 	return type == "RefCounted" or type.contains(".gd") or type.get_slice("[", 0) in ["Array", "Dictionary"]
 
 
-static func supported(type:String, parser) -> bool:
+static func supported(type:String, parser, force:bool = false) -> bool:
+	if force and (type == "Variant" or ClassDB.class_exists(type) or type.begins_with("Packed") or type in ["Callable", "Signal"]):
+		return true
 	if type in VALUES or type in ["Array", "Dictionary", "RefCounted"]:
 		return true
 	if type.contains("["):
@@ -40,7 +42,7 @@ static func supported(type:String, parser) -> bool:
 		if base not in ["Array", "Dictionary"]:
 			return false
 		for arg:String in parser.Utils.MemberParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]")):
-			if arg.strip_edges() != "Variant" and not supported(arg.strip_edges(), parser):
+			if arg.strip_edges() != "Variant" and not supported(arg.strip_edges(), parser, force):
 				return false
 		return true
 	if type.contains(".gd"):
@@ -50,7 +52,7 @@ static func supported(type:String, parser) -> bool:
 			for member:String in parts[1].replace("::", ".").split("."):
 				var nested:Variant = script.get_script_constant_map().get(member) if script != null else null
 				script = nested if nested is GDScript else null
-		return script != null and ClassDB.is_parent_class(script.get_instance_base_type(), "RefCounted")
+		return script != null and (force or ClassDB.is_parent_class(script.get_instance_base_type(), "RefCounted"))
 	return false
 
 
@@ -58,16 +60,19 @@ static func compatible(actual:String, expected:String) -> bool:
 	return actual == expected or (actual in ["int", "float"] and expected in ["int", "float"])
 
 
-static func emit(type:String, parser, aliases:Dictionary) -> String:
+static func emit(type:String, parser, aliases:Dictionary, visible:Dictionary = {}) -> String:
+	if visible.has(type):
+		return visible[type]
 	if type.contains("["):
 		var base := type.get_slice("[", 0)
 		var parts:Array = []
 		for arg:String in parser.Utils.MemberParse.safe_split_args(type.substr(base.length() + 1).trim_suffix("]")):
-			parts.append(emit(arg.strip_edges(), parser, aliases))
+			parts.append(emit(arg.strip_edges(), parser, aliases, visible))
 		return base + "[" + ", ".join(parts) + "]"
 	if type.contains(".gd"):
 		var parts := type.split("::", true, 1)
-		return dependency(parts[0], aliases) + ("." + parts[1].replace("::", ".") if parts.size() > 1 else "")
+		var base:String = visible[parts[0]] if visible.has(parts[0]) else dependency(parts[0], aliases)
+		return base + ("." + parts[1].replace("::", ".") if parts.size() > 1 else "")
 	return type
 
 

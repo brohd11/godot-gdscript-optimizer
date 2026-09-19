@@ -3,7 +3,7 @@ extends RefCounted
 
 const TypeInfo = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/types.gd")
 const TYPES = TypeInfo.VALUES
-const OPERATORS = ["true", "false", "null", "and", "or", "not", "is", "as"]
+const OPERATORS = ["true", "false", "null", "and", "or", "not", "is", "as", "if", "else"]
 const FORBIDDEN = ["await", "func", "for", "while", "match", "self", "super", "load", "preload", ";", "\\"]
 
 static func type_of(parser, expression:String, line:int, column:int = -1) -> String:
@@ -13,8 +13,10 @@ static func compatible(actual:String, expected:String) -> bool:
 	return TypeInfo.compatible(actual, expected)
 
 
-static func assess(parser, statements:Array, params:Dictionary, return_type:String) -> Dictionary:
-	var metadata := {"symbols": params.duplicate(), "globals": {}, "uses": {}, "effectful": false, "runtime_arithmetic": false}
+static func assess(parser, statements:Array, params:Dictionary, return_type:String, force:bool = false) -> Dictionary:
+	if return_type != "void":
+		statements = terminal_returns(statements)
+	var metadata := {"symbols": params.duplicate(), "globals": {}, "uses": {}, "effectful": false, "runtime_arithmetic": false, "force": force}
 	for name:String in params:
 		metadata.uses[name] = {"count": 0, "positions": [], "rebound": false, "written": false, "member": false}
 	var grammar := _block(statements, 0, 0)
@@ -47,10 +49,10 @@ static func assess(parser, statements:Array, params:Dictionary, return_type:Stri
 			declared = data[0]
 			declaration_type = TypeInfo.normalize(data[1], parser, statement.line)
 			if data[1].is_empty():
-				if not data[3] and not code.begins_with("const "):
+				if not force and not data[3] and not code.begins_with("const "):
 					return {"error": "Variant locals are not supported; use an explicit type or :="}
-				declaration_type = type_of(parser, data[2], statement.line)
-			if not TypeInfo.supported(declaration_type, parser):
+				declaration_type = type_of(parser, data[2], statement.line) if data[3] or code.begins_with("const ") else "Variant"
+			if not TypeInfo.supported(declaration_type, parser, force):
 				return {"error": "unsupported local type: " + declaration_type}
 			expression = data[2]
 		else:
@@ -60,7 +62,10 @@ static func assess(parser, statements:Array, params:Dictionary, return_type:Stri
 			if found != null:
 				var root := found.get_string(1)
 				if not metadata.symbols.has(root):
-					return {"error": "assignment must target a parameter or local"}
+					var external := external_symbol(parser, root, statement.line)
+					if external.get("kind", "") != parser.Keys.MEMBER_TYPE_STATIC_VAR:
+						return {"error": "assignment must target a parameter, local, or static variable"}
+					metadata.effectful = true
 				var tail := found.get_string(2).strip_edges().trim_suffix("+").trim_suffix("-").trim_suffix("*").trim_suffix("/")
 				if metadata.uses.has(root):
 					metadata.uses[root]["rebound" if tail.is_empty() else "written"] = true
@@ -75,7 +80,8 @@ static func assess(parser, statements:Array, params:Dictionary, return_type:Stri
 		if declared != "":
 			metadata.symbols[declared] = declaration_type
 		body.append({"text": statement.text, "tokens": parser.CodeEditParser.LambdaScanner._tokens(statement.text), "return": returned, "indent": statement.indent,
-			"declared": declared, "type": declaration_type})
+			"declared": declared, "type": declaration_type,
+			"value_type": type_of(parser, expression, statement.line) if returned and expression != "" else ""})
 	metadata.body = body
 	metadata.return_type = return_type
 	return metadata
@@ -167,12 +173,8 @@ static func _expression(parser, expression:String, line:int, metadata:Dictionary
 			var start := _receiver_start(tokens, i - 2)
 			var receiver := expression.substr(tokens[start].offset, tokens[i - 1].offset - tokens[start].offset)
 			var receiver_type := type_of(parser, receiver, line)
-			if receiver_type not in ["Variant", ""] and not TypeInfo.supported(receiver_type, parser):
+			if receiver_type not in ["Variant", ""] and not TypeInfo.supported(receiver_type, parser, metadata.get("force", false)):
 				return "unsupported member receiver: " + receiver_type
-			if i + 1 < tokens.size() and tokens[i + 1].text == "(":
-				var root:String = tokens[start].text
-				if not metadata.symbols.has(root) and receiver_type.contains(".gd") and name != "new":
-					return "nested script helper calls are deferred"
 			continue
 		if metadata.symbols.has(name):
 			if metadata.uses.has(name):
@@ -181,21 +183,105 @@ static func _expression(parser, expression:String, line:int, metadata:Dictionary
 				if i + 1 < tokens.size() and tokens[i + 1].text in [".", "["]:
 					metadata.uses[name].member = true
 			continue
-		var external:Variant = owner.get_member_data(name, true)
-		if external != null:
-			if external.get("member_type") not in [parser.Keys.MEMBER_TYPE_CONST, parser.Keys.MEMBER_TYPE_CLASS, parser.Keys.MEMBER_TYPE_ENUM]:
-				return "script functions and mutable external bindings are unsupported: " + name
-			metadata.globals[name] = {"file": owner.get_script_class_path().get_slice("::", 0), "name": name}
+		var external := external_symbol(parser, name, line)
+		if not external.is_empty():
+			metadata.globals[name] = external
+			metadata.effectful = metadata.effectful or external.get("effectful", false)
 			continue
+		if owner.get_member_data(name, true) != null:
+			return "instance-dependent reference: " + name
 		if name in TYPES or name in ["Array", "Dictionary", "RefCounted", "PI", "TAU", "INF", "NAN"] or parser.BuiltInChecker.is_global_method(name):
 			metadata.globals[name] = {}
 			continue
 		var type := type_of(parser, name, line)
-		if TypeInfo.supported(type, parser):
+		if TypeInfo.supported(type, parser, metadata.get("force", false)):
 			metadata.globals[name] = {"type": type}
 		else:
 			return "unresolved reference: " + name
 	return ""
+
+
+static func external_symbol(parser, name:String, line:int) -> Dictionary:
+	var owner = parser.get_class_object(parser.get_class_at_line(line))
+	var member:Variant = static_member_data(owner, name)
+	if member == null:
+		return {}
+	var kind:String = member.get("member_type", "")
+	if kind not in [parser.Keys.MEMBER_TYPE_CONST, parser.Keys.MEMBER_TYPE_CLASS, parser.Keys.MEMBER_TYPE_ENUM,
+		parser.Keys.MEMBER_TYPE_STATIC_VAR, parser.Keys.MEMBER_TYPE_STATIC_FUNC]:
+		return {}
+	var enums:Variant = owner.get_enum_members(name) if kind == parser.Keys.MEMBER_TYPE_ENUM else {}
+	return {"file": owner.get_script_class_path(), "name": name, "kind": kind,
+		"enum_members": enums if enums is Dictionary else {},
+		"effectful": kind in [parser.Keys.MEMBER_TYPE_STATIC_VAR, parser.Keys.MEMBER_TYPE_STATIC_FUNC]}
+
+
+static func static_member_data(owner, name:String) -> Variant:
+	if owner.functions.has(name):
+		return owner.functions[name].member_data
+	var member:Variant = owner.get_member_data(name, true)
+	return member.get("member_data") if member is Object else member
+
+
+static func terminal_returns(lines:Array) -> Array:
+	if lines.is_empty():
+		return lines
+	var result := _return_tree(lines, 0, lines[0].indent)
+	return result.body if result.end == lines.size() else lines
+
+
+static func _return_tree(lines:Array, start:int, indent:int) -> Dictionary:
+	var failed := {"body": [], "end": start}
+	if start >= lines.size() or lines[start].indent != indent:
+		return failed
+	var code:String = lines[start].code
+	if code.begins_with("return "):
+		return {"body": [lines[start]], "end": start + 1}
+	if not code.begins_with("if "):
+		return failed
+	var branches:Array = []
+	var i := start
+	var has_else := false
+	var child_indent:int = 0
+	while i < lines.size() and lines[i].indent == indent:
+		code = lines[i].code
+		if not (code.begins_with("if ") and i == start or code.begins_with("elif ") or code == "else:"):
+			break
+		if not code.ends_with(":") or i + 1 >= lines.size() or lines[i + 1].indent <= indent:
+			return failed
+		var child := _return_tree(lines, i + 1, lines[i + 1].indent)
+		if child.body.is_empty() or (child.end < lines.size() and lines[child.end].indent > indent):
+			return failed
+		child_indent = lines[i + 1].indent
+		branches.append(lines[i])
+		branches.append_array(child.body)
+		i = child.end
+		if code == "else:":
+			has_else = true
+			break
+	if not has_else:
+		var tail := _return_tree(lines, i, indent)
+		if tail.body.is_empty():
+			return failed
+		# A following guard becomes elif; a final return becomes the else body.
+		if tail.body[0].code.begins_with("if "):
+			var header:Dictionary = tail.body[0].duplicate()
+			header.code = "elif " + header.code.trim_prefix("if ")
+			header.text = " ".repeat(indent) + header.code
+			branches.append(header)
+			branches.append_array(tail.body.slice(1))
+		else:
+			var header:Dictionary = lines[start].duplicate()
+			header.code = "else:"
+			header.text = " ".repeat(indent) + header.code
+			branches.append(header)
+			for statement:Dictionary in tail.body:
+				var moved := statement.duplicate()
+				moved.indent += child_indent - indent
+				moved.text = " ".repeat(moved.indent) + moved.code
+				branches.append(moved)
+		i = tail.end
+	return {"body": branches, "end": i}
 
 
 static func rename(parser, source:String, bindings:Dictionary, slots:Array = []) -> String:

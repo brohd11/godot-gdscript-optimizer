@@ -6,7 +6,7 @@ const ValueTypes = preload("res://addons/addon_lib/gdscript_optimizer/passes/inl
 const Rewrite = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
 
 var stats:Dictionary = {"scalar_structs": 0, "scalar_accesses": 0, "scalar_skipped": 0,
-	"struct_typed_captures": 0, "struct_read_casts": 0, "struct_reads_skipped": 0}
+	"struct_typed_captures": 0, "struct_reads_skipped": 0}
 var warnings:Array = []
 var debug_events:Array = []
 var declarations:Dictionary = {}
@@ -16,7 +16,6 @@ var _field_types:Dictionary = {}
 var _types
 var _lines:PackedStringArray
 var _tokens:Array
-var _mode:int
 var _scalar_references:bool
 var _read_references:bool
 var type_dependencies:Dictionary = {}
@@ -29,9 +28,8 @@ var _complete:Dictionary = {}
 func _init(lines:PackedStringArray, types, context) -> void:
 	_lines = lines
 	_types = types
-	_mode = context.struct_read_types
-	_scalar_references = context.scalar_replacement_allow_ref_counted
-	_read_references = context.struct_read_types_allow_ref_counted
+	_scalar_references = context.aggressive
+	_read_references = context.aggressive
 	_source = types.parser.get_script_path()
 	var source := "\n".join(lines)
 	_prefix = "_struct_opt_"
@@ -44,8 +42,7 @@ func _init(lines:PackedStringArray, types, context) -> void:
 		var comment:int = Rewrite.TagRegistry.scan_code(lines[line], state)
 		_codes.append(lines[line].substr(0, comment) if comment >= 0 else lines[line])
 		_complete[line] = not continued and not state.cont and state.quote == ""
-	if context.scalar_replacement:
-		_find_scalars()
+	_find_scalars()
 
 
 func field_type(path:String, field:String) -> String:
@@ -308,8 +305,6 @@ func replacement(path:String, field:String, receiver:String, lowered:String, lin
 				stats.scalar_accesses += 1
 				debug_events.append({"line": line, "kind": "scalar-replacement", "details": {"field": field, "mode": "access"}})
 				return scalar.fields[field].name
-	if _mode == 0:
-		return lowered
 	if declarations.has(line):
 		return lowered
 	var type := field_type(path, field)
@@ -326,25 +321,20 @@ func replacement(path:String, field:String, receiver:String, lowered:String, lin
 		return lowered
 	if _explicit_cast(code, start, end, type, line):
 		return lowered
-	if _mode == 1:
-		if not _capture_safe(code, receiver, line):
-			stats.struct_reads_skipped += 1
-			warnings.append("line %d: typed field capture skipped (evaluation order or unsupported statement)" % [line + 1])
+	if not _capture_safe(code, receiver, line):
+		stats.struct_reads_skipped += 1
+		warnings.append("line %d: typed field capture skipped (evaluation order or unsupported statement)" % [line + 1])
+		return lowered
+	var declaration := RegEx.create_from_string(r"^\s*var\s+\w+\s*:\s*([\w.\[\], ]*)\s*=\s*")
+	var found := declaration.search(code)
+	if found != null and found.get_end() == start and suffix == "":
+		var destination := found.get_string(1).strip_edges()
+		if destination == "" or ValueTypes.normalize(destination, _types.parser, line) == type:
 			return lowered
-		var declaration := RegEx.create_from_string(r"^\s*var\s+\w+\s*:\s*([\w.\[\], ]*)\s*=\s*")
-		var found := declaration.search(code)
-		if found != null and found.get_end() == start and suffix == "":
-			var destination := found.get_string(1).strip_edges()
-			if destination == "" or ValueTypes.normalize(destination, _types.parser, line) == type:
-				return lowered
 	# Struct lowering can erase collection element metadata; keep the container type.
 	type = type.get_slice("[", 0) if type.contains("[") else _emit_type(type)
 	if type.is_empty():
 		return lowered
-	if _mode == 2:
-		stats.struct_read_casts += 1
-		debug_events.append({"line": line, "kind": "struct-read", "details": {"field": field, "mode": "as_casts"}})
-		return "(%s as %s)" % [lowered, type]
 	var name := _prefix + "read_%d_%d" % [line, start]
 	var indent := code.substr(0, Rewrite._indent_of(code))
 	prefixes.get_or_add(line, []).append(indent + "var %s: %s = %s" % [name, type, lowered])
