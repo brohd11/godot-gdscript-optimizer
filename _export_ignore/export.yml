@@ -2,7 +2,11 @@ export_root: "res://addons/addon_lib/gdscript_optimizer/_export_ignore/exports"
 plugin_folder: "GdscriptOptimizer{{version=res://addons/addon_lib/gdscript_optimizer}}"
 pre_script: "res://addons/addon_lib/gdscript_optimizer/_export_ignore/pre_post_export.gd"
 post_script: "res://addons/addon_lib/gdscript_optimizer/_export_ignore/pre_post_export.gd"
-build_require: "@require"
+build_require:
+  - "brohd11/godot-addon-lib@v2.1.5"
+  - "brohd11/godot-gdscript-parser@v0.2.0"
+  - "brohd11/godot-tag-parser@v0.1.0"
+  - "brohd11/godot-yaml-parser@v2.1.0"
 compile_require: []
 options:
   overwrite: true
@@ -23,12 +27,11 @@ options:
     parse_gd:
       replace_editor_interface: false
       optimizer:
+        enabled: true
         debug_tags: false
         struct_mode: tagged
         inline_mode: tagged
         aggressive: false
-        debug_tags: false
-        enabled: true
       class_rename_ignore: []
       backport_string_renames: {}
     parse_tscn: {}
