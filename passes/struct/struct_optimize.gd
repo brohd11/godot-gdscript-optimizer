@@ -2,8 +2,8 @@ extends RefCounted
 ## Optional rewrites retain original bindings and positions until every edit is planned.
 ## Newlines are inserted only at replay, so the existing struct body edits stay addressable.
 
-const ValueTypes = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/types.gd")
-const Rewrite = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
+const ValueTypes = preload("res://addons/_lib/gdscript_optimizer/passes/inline/types.gd")
+const Rewrite = preload("res://addons/_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
 
 var stats:Dictionary = {"scalar_structs": 0, "scalar_accesses": 0, "scalar_skipped": 0,
 	"struct_typed_captures": 0, "struct_reads_skipped": 0}

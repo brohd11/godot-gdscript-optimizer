@@ -1,7 +1,7 @@
 extends RefCounted
 ## Templates retain relative indentation and parameter-use metadata independently of call sites.
 
-const TypeInfo = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/types.gd")
+const TypeInfo = preload("res://addons/_lib/gdscript_optimizer/passes/inline/types.gd")
 const TYPES = TypeInfo.VALUES
 const OPERATORS = ["true", "false", "null", "and", "or", "not", "is", "as", "if", "else"]
 const FORBIDDEN = ["await", "func", "for", "while", "match", "self", "super", "load", "preload", ";", "\\"]

@@ -1,11 +1,11 @@
 extends RefCounted
 ## Definitions are catalogued once; calls are resolved on replay after preceding passes finish.
 
-const DebugTags = preload("res://addons/addon_lib/gdscript_optimizer/debug_tags.gd")
-const Registry = preload("res://addons/addon_lib/tag_parser/registry.gd")
-const Body = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/body.gd")
-const DirectExpression = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/expression.gd")
-const Arithmetic = preload("res://addons/addon_lib/gdscript_optimizer/passes/inline/arithmetic.gd")
+const DebugTags = preload("res://addons/_lib/gdscript_optimizer/debug_tags.gd")
+const Registry = preload("res://addons/_lib/tag_parser/registry.gd")
+const Body = preload("res://addons/_lib/gdscript_optimizer/passes/inline/body.gd")
+const DirectExpression = preload("res://addons/_lib/gdscript_optimizer/passes/inline/expression.gd")
+const Arithmetic = preload("res://addons/_lib/gdscript_optimizer/passes/inline/arithmetic.gd")
 
 var plans:Dictionary = {}
 var _definitions:Dictionary = {}

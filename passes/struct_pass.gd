@@ -2,11 +2,11 @@ extends RefCounted
 ## Plans against original sources, then replays edits on a consumer's output text.
 ## Path relocation and surviving global names belong to the processing context.
 
-const DebugTags = preload("res://addons/addon_lib/gdscript_optimizer/debug_tags.gd")
-const TagRegistry = preload("res://addons/addon_lib/tag_parser/registry.gd")
-const StructRewrite = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
-const StructTypes = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_types.gd")
-const StructOptimize = preload("res://addons/addon_lib/gdscript_optimizer/passes/struct/struct_optimize.gd")
+const DebugTags = preload("res://addons/_lib/gdscript_optimizer/debug_tags.gd")
+const TagRegistry = preload("res://addons/_lib/tag_parser/registry.gd")
+const StructRewrite = preload("res://addons/_lib/gdscript_optimizer/passes/struct/struct_rewrite.gd")
+const StructTypes = preload("res://addons/_lib/gdscript_optimizer/passes/struct/struct_types.gd")
+const StructOptimize = preload("res://addons/_lib/gdscript_optimizer/passes/struct/struct_optimize.gd")
 
 var plans:Dictionary = {}
 var structs:Dictionary = {}
