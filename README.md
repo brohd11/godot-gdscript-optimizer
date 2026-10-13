@@ -3,7 +3,7 @@
 Shared source transforms for Godot build tools. `StructPass` lowers `#! struct`
 data classes to arrays. `InlinePass` expands supported tagged static calls.
 It uses GDScriptParser and the shared dependency scanner through `utils_remote.gd`.
-Tag discovery and indexing use `addons/_lib/tag_parser`; the old
+Tag discovery and indexing use `EditorParser.TagParser` (`addons/_lib/editor_parser/src/tag`); the old
 `tag_registry.gd` remains a compatibility entry point.
 
 ```gdscript

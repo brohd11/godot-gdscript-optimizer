@@ -1,2 +1,2 @@
-extends "res://addons/_lib/tag_parser/registry.gd"
+extends EditorParser.TagParser.Registry
 ## Compatibility entry point; tag discovery and indexing live in the shared Tag Parser library.

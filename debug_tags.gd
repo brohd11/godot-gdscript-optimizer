@@ -1,7 +1,7 @@
 extends RefCounted
 ## Mark completed edits at logical statement boundaries, never inside a string or expression.
 
-const Scanner = preload("res://addons/_lib/tag_parser/scanner.gd")
+const Scanner = preload("uid://8uyuxn81pfir") #! resolve EditorParser.TagParser.Scanner
 
 static func annotate(lines:Array, events:Array) -> Array:
 	var starts:Array = []
