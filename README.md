@@ -7,7 +7,7 @@ Tag discovery and indexing use `EditorParser.TagParser` (`addons/_lib/editor_par
 `tag_registry.gd` remains a compatibility entry point.
 
 ```gdscript
-const Optimizer = preload("res://addons/_lib/gdscript_optimizer/optimizer.gd")
+const Optimizer = preload("res://addons/_lib/gdscript_optimizer/src/optimizer.gd")
 
 var context = Optimizer.Context.new()
 context.set_global_classes({"MyClass": "res://my_class.gd"})

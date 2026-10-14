@@ -2,11 +2,11 @@ extends RefCounted
 ## Source identities stay stable while consumers choose output paths and global-name policy.
 ## Optional callbacks let a packaging host reuse its own reference and relocation rules.
 
-const UtilsRemote = preload("res://addons/_lib/gdscript_optimizer/utils_remote.gd")
+const UtilsRemote = preload("res://addons/_lib/gdscript_optimizer/src/utils_remote.gd")
 
-const Config = preload("res://addons/_lib/gdscript_optimizer/config.gd")
+const Config = preload("res://addons/_lib/gdscript_optimizer/src/config.gd")
 
-var parser_script:GDScript = preload("res://addons/_lib/gdscript_parser/gdscript_parser.gd") #! resolve GDScriptParser
+var parser_script:GDScript = preload("res://addons/_lib/gdscript_parser/src/gdscript_parser.gd") #! resolve GDScriptParser
 var class_list:Dictionary = {}
 var class_path_lookup:Dictionary = {}
 var removed_globals:Dictionary = {}

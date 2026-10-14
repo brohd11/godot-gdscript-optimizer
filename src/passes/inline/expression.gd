@@ -1,9 +1,9 @@
 extends RefCounted
 ## Direct substitutions need their own grammar: template eligibility does not prove purity.
 
-const Types = preload("res://addons/_lib/gdscript_optimizer/passes/inline/types.gd")
-const Arithmetic = preload("res://addons/_lib/gdscript_optimizer/passes/inline/arithmetic.gd")
-const Body = preload("res://addons/_lib/gdscript_optimizer/passes/inline/body.gd")
+const Types = preload("res://addons/_lib/gdscript_optimizer/src/passes/inline/types.gd")
+const Arithmetic = preload("res://addons/_lib/gdscript_optimizer/src/passes/inline/arithmetic.gd")
+const Body = preload("res://addons/_lib/gdscript_optimizer/src/passes/inline/body.gd")
 const STRING_METHODS = {"begins_with": ["bool", "String"], "ends_with": ["bool", "String"],
 	"contains": ["bool", "String"], "is_empty": ["bool"], "get_slice": ["String", "String", "int"],
 	"trim_prefix": ["String", "String"], "trim_suffix": ["String", "String"]}

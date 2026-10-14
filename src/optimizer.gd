@@ -2,10 +2,10 @@ extends RefCounted
 ## Each preparation owns fresh pass instances. Consumers can replay plans after their own edits,
 ## or render every file up front before committing any output.
 
-const Context = preload("res://addons/_lib/gdscript_optimizer/context.gd")
-const Config = preload("res://addons/_lib/gdscript_optimizer/config.gd")
-const StructPass = preload("res://addons/_lib/gdscript_optimizer/passes/struct_pass.gd")
-const InlinePass = preload("res://addons/_lib/gdscript_optimizer/passes/inline_pass.gd")
+const Context = preload("res://addons/_lib/gdscript_optimizer/src/context.gd")
+const Config = preload("res://addons/_lib/gdscript_optimizer/src/config.gd")
+const StructPass = preload("res://addons/_lib/gdscript_optimizer/src/passes/struct_pass.gd")
+const InlinePass = preload("res://addons/_lib/gdscript_optimizer/src/passes/inline_pass.gd")
 
 var errors:Array = []
 var warnings:Array = []
