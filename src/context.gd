@@ -63,7 +63,7 @@ func references(path:String) -> Array:
 		paths = scan_references.call(path)
 	else:
 		if _scanner == null:
-			_scanner = UtilsRemote.Dependencies.new()
+			_scanner = UtilsRemote.DepScanner.new()
 			_scanner.max_depth = 1
 			_scanner.include_missing = false
 			_scanner.use_project_classes = false

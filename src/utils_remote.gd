@@ -1,3 +1,3 @@
 #! remote
 
-const Dependencies = preload("res://addons/_lib/dep_map/src/dependencies.gd")
+const DepScanner = preload("uid://dbn0kmkxa7caq") #! resolve DepMap.Scanner
