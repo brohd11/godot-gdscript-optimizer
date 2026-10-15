@@ -2,11 +2,7 @@ export_root: "res://addons/_lib/gdscript_optimizer/_export_ignore/exports"
 plugin_folder: "GdscriptOptimizer{{version=res://addons/_lib/gdscript_optimizer}}"
 pre_script: ""
 post_script: ""
-build_require:
-  - "brohd11/godot-addon-lib@v2.1.5"
-  - "brohd11/godot-gdscript-parser@v0.2.0"
-  - "brohd11/godot-tag-parser@v0.1.0"
-  - "brohd11/godot-yaml-parser@v2.1.0"
+build_require: @require
 compile_require: []
 options:
   overwrite: true
