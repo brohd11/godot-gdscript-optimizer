@@ -199,17 +199,17 @@ Replay stats expose `inline_calls`, `inline_skipped`, `inline_direct_calls`,
 `inline_repeated_access_captures`. Counts describe source sites, not runtime invocations.
 Default discovery is tagged: removal of call overhead does not guarantee a speedup for every body.
 
-Tests: `godot --headless --path . --script res://tests/gdscript_optimizer/run_headless.gd`.
+Tests: `godot --headless --path . --script res://addons/_lib/gdscript_optimizer/_export_ignore/test/run_headless.gd`.
 
 Early-return benchmark:
-`godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_early_return.gd -- 200000 7`.
+`godot --headless --path . --script res://addons/_lib/gdscript_optimizer/_export_ignore/test/benchmark_early_return.gd -- 200000 7`.
 It compares original calls with optimizer output for first/second guards, fallthrough,
 and mixed inputs. Void effects are inlined; typed-result helpers remain as a control
 (the report includes `inlined`). Checksums verify behavior;
 median timings exclude optimization, compilation, and warmup.
 
 Predicate benchmark (original versus transformed code, median microseconds and checksum):
-`godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_expression.gd -- 200000 7`.
+`godot --headless --path . --script res://addons/_lib/gdscript_optimizer/_export_ignore/test/benchmark_expression.gd -- 200000 7`.
 It reports typed and Variant callers with the Variant opt-in disabled/enabled; timings
 exclude optimization, compilation, startup, and warmup. No fixed speedup is asserted.
 
@@ -258,6 +258,6 @@ comments. Markers sit at logical statement boundaries and record source provenan
 inline markers include helper identity, mode, options and depth. Default is false.
 
 Evaluation-aware benchmark:
-`godot --headless --path . --script res://tests/gdscript_optimizer/benchmark_composition.gd -- 100000 7`.
+`godot --headless --path . --script res://addons/_lib/gdscript_optimizer/_export_ignore/test/benchmark_composition.gd -- 100000 7`.
 It checks both result counts and the different expected call counts for ordinary and
 substituted helpers before reporting median timings.
