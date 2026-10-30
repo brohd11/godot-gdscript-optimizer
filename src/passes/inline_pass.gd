@@ -317,6 +317,8 @@ func apply(key:String, input_lines:Array) -> Dictionary:
 		if edits.any(func(edit): return edit.start <= site.start and edit.end >= site.end):
 			continue
 		var replacement := _expand(site, parser, path, source)
+		if site.get("unrelated", false):
+			continue
 		if replacement.is_empty():
 			result.stats.inline_skipped += 1
 			if _context.inline_mode != "auto":
@@ -358,6 +360,19 @@ func _resolve_call(site:Dictionary, parser, path:String, inside:bool = false) ->
 	if not inside and _tagged.has(class_obj.get_script_class_path() + Registry.MEMBER_DELIM + function.name):
 		return {}
 	var callee:String = site.callee.replace(" ", "").replace("\t", "")
+	# Candidates match by name only: a call on a local or member value (`arr.any(...)`) or a local
+	# callable is never a tagged static func, so it is skipped without a diagnostic.
+	var locals:Dictionary = function.get_in_scope_local_vars(site.line, site.column)
+	var alias := callee.get_slice(".", 0) if callee.contains(".") else ""
+	if alias != "":
+		var member:Variant = class_obj.get_member_data(alias, true)
+		if locals.has(alias) or class_obj.members.has(alias) \
+				or (member is Dictionary and member.get("member_type") != _context.parser_script.Keys.MEMBER_TYPE_CONST):
+			site.unrelated = true
+			return {}
+	elif locals.has(callee):
+		site.unrelated = true
+		return {}
 	var rich:Dictionary = parser.resolve_expression_to_type_rich(callee, site.line, site.column)
 	var identity:String = rich.get("origin", "").trim_suffix(_context.parser_script.Keys.CALLABLE_SUFFIX)
 	if not _catalog.has(identity):
@@ -367,20 +382,15 @@ func _resolve_call(site:Dictionary, parser, path:String, inside:bool = false) ->
 		site.reason = _definition_errors.get(identity, "unsupported nested inline")
 		site.fatal = site.reason.contains("cycle") or site.reason.contains("limit")
 		return {}
-	var locals:Dictionary = function.get_in_scope_local_vars(site.line, site.column)
-	if callee.contains("."):
-		var alias := callee.get_slice(".", 0)
-		if alias in ["self", "super"] or locals.has(alias) or class_obj.members.has(alias):
-			return {}
-		var member:Variant = class_obj.get_member_data(alias, true)
-		if member is Dictionary and member.get("member_type") != _context.parser_script.Keys.MEMBER_TYPE_CONST:
+	if alias != "":
+		if alias in ["self", "super"]:
 			return {}
 		var receiver:String = parser.resolve_expression_to_type(alias, site.line, site.column)
 		if receiver.contains(_context.parser_script.Keys.TYPE_DELIM):
 			receiver = receiver.get_slice(_context.parser_script.Keys.TYPE_DELIM, 1)
 		if receiver != definition.file:
 			return {}
-	elif locals.has(callee) or not function.is_static() or path != definition.file:
+	elif not function.is_static() or path != definition.file:
 		return {}
 	var supplied:Array = _context.parser_script.Utils.MemberParse.safe_split_args(site.args)
 	if site.args.strip_edges().is_empty():

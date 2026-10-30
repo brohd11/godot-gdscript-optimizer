@@ -10,6 +10,7 @@ static func run_tests() -> Dictionary:
 	_failures = []
 	_passed = 0
 	_test_arithmetic()
+	_test_name_collision()
 	var sources:Dictionary = {}
 	for name:String in ["math", "caller"]:
 		var path := BASE + name + ".gd"
@@ -61,6 +62,26 @@ static func run_tests() -> Dictionary:
 	var output:Array = ["inline: %d passed, %d failed" % [_passed, _failures.size()]]
 	output.append_array(_failures)
 	return {"result": _failures.size(), "output": output}
+
+
+## `.any(...)` on a local, param or member is Array.any, not the tagged `any`: skipped silently,
+## while the real tagged call still inlines.
+static func _test_name_collision() -> void:
+	var sources:Dictionary = {}
+	for name:String in ["collision", "collision_caller"]:
+		sources[BASE + name + ".gd"] = BASE + name + ".gd"
+	var optimizer = Optimizer.new()
+	var prepared = optimizer.prepare(sources, Optimizer.Context.new(), [Optimizer.InlinePass])
+	_check("collision prepare", prepared.errors, [])
+	var path := BASE + "collision_caller.gd"
+	var edited := optimizer.apply(path, Array(FileAccess.get_file_as_string(path).split("\n")))
+	_check("collision apply", edited.errors, [])
+	_check("collision no warnings", edited.warnings, [])
+	_check("collision not counted as skipped", edited.stats.inline_skipped, 0)
+	_check("collision tagged call inlined", edited.stats.inline_calls, 1)
+	var text := "\n".join(edited.lines)
+	_check("collision Array.any kept", text.count(".any(func(v)"), 3)
+	_check("collision tagged call rewritten", text.contains("Collision.any("), false)
 
 
 static func _test_arithmetic() -> void:
